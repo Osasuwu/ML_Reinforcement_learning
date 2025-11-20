@@ -11,7 +11,7 @@ class QLearningAgent:
     Q-learning агент для управления двухколёсным роботом.
     """
     
-    def __init__(self, n_actions=5, learning_rate=0.3, discount_factor=0.98,
+    def __init__(self, n_actions=10, learning_rate=0.3, discount_factor=0.98,
                  epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
         self.n_actions = n_actions
         self.alpha = learning_rate
@@ -27,28 +27,33 @@ class QLearningAgent:
         """
         Дискретизация непрерывного состояния.
         state: [x_robot, y_robot, yaw, angle_to_target, distance]
+        
+        УПРОЩЁННАЯ версия для лучшего обобщения:
+        - 8 направлений (каждые 45°) вместо 36
+        - 5 уровней расстояния вместо 6
+        - Итого: 8 × 5 = 40 состояний (вместо 216)
         """
         x, y, yaw, angle_to_target, distance = state
         
-        # Дискретизация угла к цели (12 направлений - каждые 30 градусов)
-        angle_bin = int(np.floor((angle_to_target + np.pi) / (2 * np.pi / 12)))
-        angle_bin = np.clip(angle_bin, 0, 11)
+        # Дискретизация угла к цели (8 направлений - каждые 45 градусов)
+        # -180°: bin 0, -135°: bin 1, -90°: bin 2, -45°: bin 3,
+        #    0°: bin 4,   45°: bin 5,  90°: bin 6, 135°: bin 7
+        angle_bin = int(np.floor((angle_to_target + np.pi) / (2 * np.pi / 8)))
+        angle_bin = np.clip(angle_bin, 0, 7)
         
-        # Дискретизация расстояния (6 уровней)
-        if distance < 0.5:
-            dist_bin = 0
-        elif distance < 1.0:
-            dist_bin = 1
+        # Дискретизация расстояния (5 уровней - более крупные бины)
+        if distance < 0.7:
+            dist_bin = 0  # Очень близко
         elif distance < 1.5:
-            dist_bin = 2
+            dist_bin = 1  # Близко
         elif distance < 2.5:
-            dist_bin = 3
+            dist_bin = 2  # Средне
         elif distance < 3.5:
-            dist_bin = 4
+            dist_bin = 3  # Далеко
         else:
-            dist_bin = 5
+            dist_bin = 4  # Очень далеко
         
-        # Состояние: 12 углов x 6 расстояний = 72 состояния (оптимально для Q-learning)
+        # Состояние: 8 углов x 5 расстояний = 40 состояний
         return (angle_bin, dist_bin)
     
     def get_action(self, state):
@@ -123,7 +128,8 @@ def train_agent(n_episodes=1500, render_interval=500, gui=False, save_path="q_ta
     print("ОБУЧЕНИЕ РОБОТА-НАВИГАТОРА")
     print("=" * 70)
     print(f"Параметры: episodes={n_episodes}, α={agent.alpha}, γ={agent.gamma}")
-    print(f"Дискретные действия: [вперёд, назад, влево, вправо, стоять]")
+    print(f"Действия (10): [быстро, средне, медленно вперёд, медленно/быстро назад,")
+    print(f"               плавный/резкий поворот влево, плавный/резкий вправо, стоять]")
     print("-" * 70)
     
     for episode in range(n_episodes):
@@ -262,14 +268,15 @@ def test_agent(agent, n_episodes=5, gui=True):
     print("ТЕСТИРОВАНИЕ ОБУЧЕННОГО АГЕНТА")
     print("=" * 70)
     
-    action_names = ['Вперёд', 'Назад', 'Влево', 'Вправо', 'Стоять']
+    action_names = ['Быстро вперёд', 'Средне вперёд', 'Медленно вперёд', 'Медленно назад', 'Быстро назад', 
+                    'Плавный поворот влево', 'Резкий поворот влево', 'Плавный поворот вправо', 'Резкий поворот вправо', 'Стоять']
     
     for episode in range(n_episodes):
         state = env.reset()
         total_reward = 0
         done = False
         step_count = 0
-        action_counts = [0] * 5
+        action_counts = [0] * 10
         
         initial_distance = env._get_distance()
         
@@ -317,7 +324,7 @@ if __name__ == "__main__":
         n_episodes=1500,
         render_interval=500,
         gui=False,  # Установите True для визуализации процесса обучения
-        save_path=r"RL2\q_table_robot.pkl"
+        save_path=r"q_table_robot.pkl"
     )
     
     # Визуализация результатов
