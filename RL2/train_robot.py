@@ -11,9 +11,9 @@ class QLearningAgent:
     Q-learning агент для управления двухколёсным роботом.
     """
     
-    def __init__(self, n_actions=10, learning_rate=0.3, discount_factor=0.98,
-                 epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
-        self.n_actions = n_actions
+    def __init__(self, n_actions=27, learning_rate=0.2, discount_factor=0.95,
+                 epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.015):
+        self.n_actions = n_actions  # 27 действий (3 скорости × 3x3 комбинации колёс)
         self.alpha = learning_rate
         self.gamma = discount_factor
         self.epsilon = epsilon
@@ -28,32 +28,28 @@ class QLearningAgent:
         Дискретизация непрерывного состояния.
         state: [x_robot, y_robot, yaw, angle_to_target, distance]
         
-        УПРОЩЁННАЯ версия для лучшего обобщения:
-        - 8 направлений (каждые 45°) вместо 36
-        - 5 уровней расстояния вместо 6
-        - Итого: 8 × 5 = 40 состояний (вместо 216)
+        Упрощённая версия для индивидуального управления колёсами:
+        - 12 направлений (каждые 30°)
+        - 4 уровня расстояния
+        - Итого: 12 × 4 = 48 состояний
         """
         x, y, yaw, angle_to_target, distance = state
         
-        # Дискретизация угла к цели (8 направлений - каждые 45 градусов)
-        # -180°: bin 0, -135°: bin 1, -90°: bin 2, -45°: bin 3,
-        #    0°: bin 4,   45°: bin 5,  90°: bin 6, 135°: bin 7
-        angle_bin = int(np.floor((angle_to_target + np.pi) / (2 * np.pi / 8)))
-        angle_bin = np.clip(angle_bin, 0, 7)
+        # Дискретизация угла к цели (12 направлений - каждые 30 градусов)
+        angle_bin = int(np.floor((angle_to_target + np.pi) / (2 * np.pi / 12)))
+        angle_bin = np.clip(angle_bin, 0, 11)
         
-        # Дискретизация расстояния (5 уровней - более крупные бины)
-        if distance < 0.7:
+        # Дискретизация расстояния (4 уровня)
+        if distance < 1.0:
             dist_bin = 0  # Очень близко
-        elif distance < 1.5:
+        elif distance < 2.0:
             dist_bin = 1  # Близко
-        elif distance < 2.5:
+        elif distance < 3.0:
             dist_bin = 2  # Средне
-        elif distance < 3.5:
-            dist_bin = 3  # Далеко
         else:
-            dist_bin = 4  # Очень далеко
+            dist_bin = 3  # Далеко
         
-        # Состояние: 8 углов x 5 расстояний = 40 состояний
+        # Состояние: 12 углов x 4 расстояния = 48 состояний
         return (angle_bin, dist_bin)
     
     def get_action(self, state):
@@ -128,8 +124,10 @@ def train_agent(n_episodes=1500, render_interval=500, gui=False, save_path="q_ta
     print("ОБУЧЕНИЕ РОБОТА-НАВИГАТОРА")
     print("=" * 70)
     print(f"Параметры: episodes={n_episodes}, α={agent.alpha}, γ={agent.gamma}")
-    print(f"Действия (10): [быстро, средне, медленно вперёд, медленно/быстро назад,")
-    print(f"               плавный/резкий поворот влево, плавный/резкий вправо, стоять]")
+    print(f"Действия (27): Индивидуальное управление колёсами + выбор скорости")
+    print(f"  Скорость: Медленная(0.4x), Средняя(0.7x), Быстрая(1.0x)")
+    print(f"  Левое/Правое: Назад, Стоп, Вперёд")
+    print(f"  action = speed*9 + left*3 + right")
     print("-" * 70)
     
     for episode in range(n_episodes):
@@ -268,15 +266,24 @@ def test_agent(agent, n_episodes=5, gui=True):
     print("ТЕСТИРОВАНИЕ ОБУЧЕННОГО АГЕНТА")
     print("=" * 70)
     
-    action_names = ['Быстро вперёд', 'Средне вперёд', 'Медленно вперёд', 'Медленно назад', 'Быстро назад', 
-                    'Плавный поворот влево', 'Резкий поворот влево', 'Плавный поворот вправо', 'Резкий поворот вправо', 'Стоять']
+    def get_action_name(action):
+        """Получить название действия по его номеру"""
+        speed_level = action // 9
+        wheel_combo = action % 9
+        left = wheel_combo // 3
+        right = wheel_combo % 3
+        
+        speed_names = ['Медленно', 'Средне', 'Быстро']
+        wheel_names = ['Назад', 'Стоп', 'Вперёд']
+        
+        return f"{speed_names[speed_level]}: L:{wheel_names[left]}, R:{wheel_names[right]}"
     
     for episode in range(n_episodes):
         state = env.reset()
         total_reward = 0
         done = False
         step_count = 0
-        action_counts = [0] * 10
+        action_counts = [0] * 27  # 27 действий вместо 9
         
         initial_distance = env._get_distance()
         
@@ -305,10 +312,14 @@ def test_agent(agent, n_episodes=5, gui=True):
         print(f"  Шагов: {step_count}")
         print(f"  Награда: {total_reward:.2f}")
         print(f"  Финальное расстояние: {final_distance:.2f}м")
-        print(f"  Использование действий:")
-        for i, name in enumerate(action_names):
-            if action_counts[i] > 0:
-                print(f"    {name}: {action_counts[i]} раз ({action_counts[i]/step_count*100:.1f}%)")
+        print(f"  Использование действий (топ-5):")
+        
+        # Показываем только топ-5 наиболее используемых действий
+        action_usage = [(i, count) for i, count in enumerate(action_counts) if count > 0]
+        action_usage.sort(key=lambda x: x[1], reverse=True)
+        
+        for i, (action, count) in enumerate(action_usage[:5]):
+            print(f"    {get_action_name(action)}: {count} раз ({count/step_count*100:.1f}%)")
         
         if final_distance < env.goal_threshold:
             print("  ✓ ЦЕЛЬ ДОСТИГНУТА!")
@@ -321,7 +332,7 @@ def test_agent(agent, n_episodes=5, gui=True):
 if __name__ == "__main__":
     # Обучение агента
     agent, rewards, lengths, distances = train_agent(
-        n_episodes=1500,
+        n_episodes=2000,
         render_interval=500,
         gui=False,  # Установите True для визуализации процесса обучения
         save_path=r"q_table_robot.pkl"

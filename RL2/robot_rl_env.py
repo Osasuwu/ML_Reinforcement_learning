@@ -12,9 +12,9 @@ class RobotEnv:
     
     def __init__(self, gui=False):
         self.gui = gui
-        self.max_steps = 150  # Уменьшено для мотивации быстрее достигать цель
+        self.max_steps = 150
         self.goal_threshold = 0.5
-        self.max_velocity = 20.0  # Снижена для плавности
+        self.max_velocity = 20.0 
         self.max_force = 10.0
         
         # Инициализация PyBullet
@@ -98,37 +98,54 @@ class RobotEnv:
         return self._get_state()
     
     def step(self, action):
-        # Расширенная система действий с контролем скорости
-        # При отрицательных скоростях робот едет вперед
+        """
+        Контроль над каждым колесом отдельно с выбором скорости.
         
-        # Действия 0-2: Движение вперёд с разной скоростью
-        if action == 0:  # Вперёд быстро
-            vl, vr = -self.max_velocity, -self.max_velocity
-        elif action == 1:  # Вперёд медленно (более стабильно)
-            vl, vr = -self.max_velocity * 0.5, -self.max_velocity * 0.5
-        elif action == 2:  # Вперёд очень медленно (точная коррекция)
-            vl, vr = -self.max_velocity * 0.3, -self.max_velocity * 0.3
+        Действия (27 возможных комбинаций):
+        action = speed_level * 9 + left_wheel_action * 3 + right_wheel_action
         
-        # Действия 3-4: Движение назад
-        elif action == 3:  # Назад медленно
-            vl, vr = self.max_velocity * 0.4, self.max_velocity * 0.4
-        elif action == 4:  # Назад быстро
-            vl, vr = self.max_velocity * 0.6, self.max_velocity * 0.6
+        Каждое колесо может быть в одном из трёх состояний:
+        0: Назад (forward movement, т.к. отрицательная скорость)
+        1: Стоп
+        2: Вперёд (backward movement, т.к. положительная скорость)
         
-        # Действия 5-6: Плавные повороты влево (дуга)
-        elif action == 5:  # Плавный поворот влево (едет и поворачивает)
-            vl, vr = -self.max_velocity * 0.4, -self.max_velocity * 0.9
-        elif action == 6:  # Резкий поворот влево на месте
-            vl, vr = self.max_velocity * 0.6, -self.max_velocity * 0.6
+        Уровни скорости:
+        0: Медленная (0.4x max_velocity)
+        1: Средняя (0.7x max_velocity)
+        2: Быстрая (1.0x max_velocity)
         
-        # Действия 7-8: Плавные повороты вправо (дуга)
-        elif action == 7:  # Плавный поворот вправо (едет и поворачивает)
-            vl, vr = -self.max_velocity * 0.9, -self.max_velocity * 0.4
-        elif action == 8:  # Резкий поворот вправо на месте
-            vl, vr = -self.max_velocity * 0.6, self.max_velocity * 0.6
+        Примеры действий:
+        0-8: Медленная скорость, различные комбинации колёс
+        9-17: Средняя скорость, различные комбинации колёс
+        18-26: Быстрая скорость, различные комбинации колёс
+        """
         
-        else:  # action == 9: Стоять
-            vl, vr = 0, 0
+        # Декодируем действие
+        speed_level = action // 9
+        wheel_combo = action % 9
+        left_action = wheel_combo // 3
+        right_action = wheel_combo % 3
+        
+        # Определяем множитель скорости
+        if speed_level == 0:
+            speed_mult = 0.4  # Медленная
+        elif speed_level == 1:
+            speed_mult = 0.7  # Средняя
+        else:  # speed_level == 2
+            speed_mult = 1.0  # Быстрая
+        
+        # Преобразуем действие в скорость колеса
+        # 0 -> -max_velocity (вперёд), 1 -> 0 (стоп), 2 -> +max_velocity (назад)
+        def action_to_velocity(wheel_action, speed_multiplier):
+            if wheel_action == 0:
+                return -self.max_velocity * speed_multiplier
+            elif wheel_action == 1:
+                return 0.0
+            else:  # wheel_action == 2
+                return self.max_velocity * speed_multiplier
+        
+        vl = action_to_velocity(left_action, speed_mult)
+        vr = action_to_velocity(right_action, speed_mult)
         
         # Левые колёса: 6 (переднее), 7 (заднее)
         p.setJointMotorControl2(self.robot_id, 6, p.VELOCITY_CONTROL,
@@ -151,89 +168,49 @@ class RobotEnv:
         self.robot_pos = np.array(pos[:2])
         self.robot_yaw = p.getEulerFromQuaternion(orn)[2]
         
-        # Получаем текущее состояние для расчета награды
-        state = self._get_state()
-        angle_to_target = state[3]  # Угол к цели
-        
-        # Награда за приближение к цели
+        # Вычисление расстояния до цели
         current_dist = np.linalg.norm(self.robot_pos - self.target_pos)
-        distance_reward = (self.prev_distance - current_dist) * 20.0
         
-        # Штраф за каждый шаг (мотивация быстрее достигать цель)
-        step_penalty = -0.15
+        # Получаем состояние для вычисления угла к цели
+        state = self._get_state()
+        angle_to_target = state[3]
         
-        # УБИРАЕМ все штрафы за скорость - робот должен ехать БЫСТРО!
-        speed_penalty = 0.0
+        # Упрощённая система наград (в сотых долях)
+        # 1. Награда за приближение к цели
+        distance_reward = (self.prev_distance - current_dist) * 1
         
-        # Симметричная награда: робот может ехать вперёд ИЛИ назад к цели
-        # Награда за направление - смотрит на цель (0°) или от цели (180°)
+        # 2. Штраф за каждый шаг (мотивация быстрее достигать цели)
+        step_penalty = -0.01
+        
+        # 3. Награда за выравнивание на цель (приоритет движения по прямой)
         angle_abs = abs(angle_to_target)
-        
-        # Вперёд к цели (угол близок к 0°) ИЛИ назад к цели (угол близок к 180°)
-        if angle_abs < np.pi / 18:  # Менее 10° - смотрит ПРЯМО на цель
-            alignment_reward = 0.3
-        elif angle_abs > 35 * np.pi / 18:  # Более 170° - смотрит НАЗАД на цель (может ехать назад!)
-            alignment_reward = 0.3  # Та же награда!
-        elif angle_abs < np.pi / 12:  # 10-15° - хорошо
-            alignment_reward = 0.15
-        elif angle_abs > 11 * np.pi / 12:  # 170-175° - тоже хорошо для движения назад
-            alignment_reward = 0.15
-        elif angle_abs < np.pi / 6 or angle_abs > 5 * np.pi / 6:  # 10-30° или 150-170° - нормально
-            alignment_reward = 0.0
-        else:  # Смотрит боком - нужно поворачивать
-            alignment_reward = -0.1
-        
-        # Бонус за правильные действия (учитываем ЗНАК угла!)
-        action_bonus = 0.0
-        
-        # Если смотрит на цель (угол близок к 0) - ехать вперёд БЫСТРО!
-        if angle_abs < np.pi / 6:  # -30° до +30° - направлен к цели
-            if action == 0:  # Быстро вперёд - ОТЛИЧНО! Максимальный бонус!
-                action_bonus = 0.5
-            elif action == 1:  # Средне вперёд - нормально
-                action_bonus = 0.2
-            elif action == 2:  # Медленно вперёд - плохо, надо быстрее!
-                action_bonus = 0.0
-        
-        # Если смотрит от цели (угол близок к ±180°) - можно ехать НАЗАД (экономим на развороте)
-        elif angle_abs > 5 * np.pi / 6:  # >150° - смотрит назад на цель
-            if action == 4:  # Назад быстро - эффективно!
-                action_bonus = 0.4
-            elif action == 3:  # Назад медленно - лучше чем стоять
-                action_bonus = 0.1
-        
-        # Если смотрит боком - нужно поворачивать В ПРАВИЛЬНУЮ СТОРОНУ
+        if angle_abs < np.pi / 18:  # < 10° - смотрит прямо на цель
+            alignment_reward = 0.05
+        elif angle_abs < np.pi / 9:  # < 20° - почти прямо
+            alignment_reward = 0.02
         else:
-            # Цель слева (положительный угол) - поворачивать ВЛЕВО
-            if angle_to_target > 0:
-                if action in [5, 6]:  # Поворот влево - ПРАВИЛЬНО!
-                    action_bonus = 0.25 if action == 6 else 0.15  # Резкий быстрее
-            # Цель справа (отрицательный угол) - поворачивать ВПРАВО
-            else:
-                if action in [7, 8]:  # Поворот вправо - ПРАВИЛЬНО!
-                    action_bonus = 0.25 if action == 8 else 0.15  # Резкий быстрее
+            alignment_reward = 0.0
+        
+        # 4. Награда за достижение цели
+        goal_reward = 0.0
+        done = False
+        
+        if current_dist < self.goal_threshold:
+            goal_reward = 10.0
+            done = True
         
         # Суммарная награда
-        reward = distance_reward + step_penalty + alignment_reward + action_bonus + speed_penalty
-        
-        self.prev_action = action
-        
-        # Проверка завершения
-        done = False
-        if current_dist < self.goal_threshold:
-            # Большой бонус за достижение цели + бонус за скорость
-            time_bonus = max(0, (self.max_steps - self.current_step) * 1.0)
-            reward += 100.0 + time_bonus
-            done = True
+        reward = distance_reward + step_penalty + alignment_reward + goal_reward
         
         self.prev_distance = current_dist
         self.current_step += 1
         
+        # Проверка лимита шагов
         if self.current_step >= self.max_steps:
             done = True
         
+        # Проверка выхода за границы
         if abs(self.robot_pos[0]) > 5 or abs(self.robot_pos[1]) > 5:
-            reward -= 5.0
             done = True
         
         return self._get_state(), reward, done, {}
@@ -253,12 +230,8 @@ class RobotEnv:
         dy = self.target_pos[1] - self.robot_pos[1]
         distance = np.linalg.norm([dx, dy])
         
-        # Нормализация yaw
+        # Сырой yaw без нормализации (как координаты)
         yaw = self.robot_yaw
-        while yaw > np.pi:
-            yaw -= 2 * np.pi
-        while yaw < -np.pi:
-            yaw += 2 * np.pi
         
         # При отрицательных скоростях колес (-V/-V), робот едет "вперёд"
         # При yaw=0° робот едет в направлении +90° (на север, вдоль +Y)

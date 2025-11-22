@@ -32,18 +32,17 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
     print(f"Количество тестов: {n_episodes}")
     print("=" * 80)
     
-    action_names = [
-        'Вперёд быстро',
-        'Вперёд средне', 
-        'Вперёд медленно',
-        'Назад медленно',
-        'Назад быстро',
-        'Плавный поворот влево',
-        'Резкий поворот влево',
-        'Плавный поворот вправо',
-        'Резкий поворот вправо',
-        'Стоять'
-    ]
+    def get_action_name(action):
+        """Получить название действия по его номеру"""
+        speed_level = action // 9
+        wheel_combo = action % 9
+        left = wheel_combo // 3
+        right = wheel_combo % 3
+        
+        speed_names = ['Медленно', 'Средне', 'Быстро']
+        wheel_names = ['Назад', 'Стоп', 'Вперёд']
+        
+        return f"{speed_names[speed_level]}: L:{wheel_names[left]}, R:{wheel_names[right]}"
     
     results = []
     total_rewards = []
@@ -55,7 +54,7 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
         total_reward = 0
         done = False
         step_count = 0
-        action_counts = [0] * 10
+        action_counts = [0] * 27  # 27 действий вместо 10
         
         initial_distance = env._get_distance()
         
@@ -89,7 +88,7 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
                 current_dist = env._get_distance()
                 print(f"Шаг {step_count:3d}: расстояние={current_dist:.2f}м, "
                       f"угол={np.degrees(next_state[3]):+6.1f}°, "
-                      f"действие={action_names[action]}")
+                      f"действие={get_action_name(action)}")
             
             state = next_state
         
@@ -120,11 +119,15 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
         print(f"  Начальное расстояние: {initial_distance:.2f}м")
         print(f"  Финальное расстояние: {final_distance:.2f}м")
         print(f"  Улучшение: {initial_distance - final_distance:.2f}м ({(initial_distance - final_distance)/initial_distance*100:.1f}%)")
-        print(f"\n  Использование действий:")
-        for i, name in enumerate(action_names):
-            if action_counts[i] > 0:
-                percentage = action_counts[i] / step_count * 100
-                print(f"    {name:8s}: {action_counts[i]:3d} раз ({percentage:5.1f}%)")
+        print(f"\n  Использование действий (топ-5):")
+        
+        # Показываем только топ-5 наиболее используемых действий
+        action_usage = [(i, count) for i, count in enumerate(action_counts) if count > 0]
+        action_usage.sort(key=lambda x: x[1], reverse=True)
+        
+        for i, (action, count) in enumerate(action_usage[:5]):
+            percentage = count / step_count * 100
+            print(f"    {get_action_name(action):30s}: {count:3d} раз ({percentage:5.1f}%)")
     
     # Итоговая статистика
     print("\n" + "=" * 80)
