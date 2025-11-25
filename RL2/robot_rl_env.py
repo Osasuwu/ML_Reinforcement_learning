@@ -14,8 +14,8 @@ class RobotEnv:
         self.gui = gui
         self.max_steps = 150
         self.goal_threshold = 0.5
-        self.max_velocity = 20.0 
-        self.max_force = 10.0
+        self.max_velocity = 15.0  # Уменьшено с 20.0 чтобы робот не падал
+        self.max_force = 8.0      # Уменьшено с 10.0 для стабильности
         
         # Инициализация PyBullet
         if self.gui:
@@ -174,16 +174,21 @@ class RobotEnv:
         # Получаем состояние для вычисления угла к цели
         state = self._get_state()
         angle_to_target = state[3]
+        prev_angle = abs(getattr(self, 'prev_angle_to_target', angle_to_target))
         
-        # Упрощённая система наград (в сотых долях)
+        # Улучшенная система наград
         # 1. Награда за приближение к цели
-        distance_reward = (self.prev_distance - current_dist) * 1
+        distance_reward = (self.prev_distance - current_dist) * 1.0
         
         # 2. Штраф за каждый шаг (мотивация быстрее достигать цели)
         step_penalty = -0.01
         
-        # 3. Награда за выравнивание на цель (приоритет движения по прямой)
+        # 3. Награда за уменьшение угла к цели (учим поворачиваться)
         angle_abs = abs(angle_to_target)
+        angle_improvement = prev_angle - angle_abs
+        turning_reward = angle_improvement * 0.3  # Награда за поворот к цели
+        
+        # 4. Награда за выравнивание на цель
         if angle_abs < np.pi / 18:  # < 10° - смотрит прямо на цель
             alignment_reward = 0.05
         elif angle_abs < np.pi / 9:  # < 20° - почти прямо
@@ -191,7 +196,17 @@ class RobotEnv:
         else:
             alignment_reward = 0.0
         
-        # 4. Награда за достижение цели
+        # 5. Штраф за бездействие когда далеко от цели
+        # Проверяем, стоит ли робот на месте
+        if action == 4 or action == 13 or action == 22:  # L:Стоп, R:Стоп на любой скорости
+            if current_dist > 0.7:  # Если далеко от цели
+                idle_penalty = -0.05  # Сильный штраф за стояние
+            else:
+                idle_penalty = 0.0  # Близко к цели - можно остановиться
+        else:
+            idle_penalty = 0.0
+        
+        # 6. Награда за достижение цели
         goal_reward = 0.0
         done = False
         
@@ -200,7 +215,10 @@ class RobotEnv:
             done = True
         
         # Суммарная награда
-        reward = distance_reward + step_penalty + alignment_reward + goal_reward
+        reward = distance_reward + step_penalty + turning_reward + alignment_reward + idle_penalty + goal_reward
+        
+        # Сохраняем текущий угол для следующего шага
+        self.prev_angle_to_target = angle_abs
         
         self.prev_distance = current_dist
         self.current_step += 1
@@ -212,6 +230,12 @@ class RobotEnv:
         # Проверка выхода за границы
         if abs(self.robot_pos[0]) > 5 or abs(self.robot_pos[1]) > 5:
             done = True
+        
+        # Проверка падения робота (высота меньше 15см)
+        robot_height = pos[2]
+        if robot_height < 0.15:
+            done = True
+            reward -= 5.0  # Большой штраф за падение
         
         return self._get_state(), reward, done, {}
     
@@ -230,12 +254,13 @@ class RobotEnv:
         dy = self.target_pos[1] - self.robot_pos[1]
         distance = np.linalg.norm([dx, dy])
         
-        # Сырой yaw без нормализации (как координаты)
+        # Сырой yaw робота
         yaw = self.robot_yaw
         
-        # При отрицательных скоростях колес (-V/-V), робот едет "вперёд"
-        # При yaw=0° робот едет в направлении +90° (на север, вдоль +Y)
-        # Это означает: направление движения = yaw + 90°
+        # Для R2D2: при yaw=0° робот физически направлен вдоль +Y (на север)
+        # Но мы хотим, чтобы "вперёд" было вдоль +X
+        # Поэтому добавляем коррекцию -90° (или -π/2)
+        # При отрицательных скоростях колес (-V/-V) робот едет "вперёд"
         actual_forward_direction = yaw + np.pi/2
         
         # Угол к цели относительно направления движения робота
@@ -248,7 +273,9 @@ class RobotEnv:
         while angle_to_target < -np.pi:
             angle_to_target += 2 * np.pi
         
-        return np.array([self.robot_pos[0], self.robot_pos[1], yaw, 
+        # Возвращаем состояние: позиция, угол к цели, расстояние
+        # (убран yaw - используем только относительный угол)
+        return np.array([self.robot_pos[0], self.robot_pos[1], 
                         angle_to_target, distance])
     
     def _get_distance(self):

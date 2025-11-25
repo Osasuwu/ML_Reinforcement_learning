@@ -2,6 +2,7 @@ import numpy as np
 from robot_rl_env import RobotEnv
 from train_robot import QLearningAgent
 import time
+import math
 
 
 def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, render_delay=0.03):
@@ -64,7 +65,7 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
         print(f"Начальная позиция робота: ({state[0]:.2f}, {state[1]:.2f})")
         print(f"Позиция цели: ({env.target_pos[0]:.2f}, {env.target_pos[1]:.2f})")
         print(f"Начальное расстояние: {initial_distance:.2f}м")
-        print(f"Начальный угол к цели: {np.degrees(state[3]):.1f}°")
+        print(f"Угол к цели: {state[2]:.4f} rad ({math.degrees(state[2]):.1f}°)")
         print("-" * 80)
         
         # Запуск эпизода
@@ -86,9 +87,10 @@ def test_trained_agent(model_path="q_table_robot.pkl", n_episodes=10, gui=True, 
             # Вывод прогресса каждые 20 шагов
             if step_count % 20 == 0:
                 current_dist = env._get_distance()
-                print(f"Шаг {step_count:3d}: расстояние={current_dist:.2f}м, "
-                      f"угол={np.degrees(next_state[3]):+6.1f}°, "
-                      f"действие={get_action_name(action)}")
+                
+                print(f"Шаг {step_count:3d}: dist={current_dist:.2f}м, "
+                      f"angle={next_state[2]:.3f}({math.degrees(next_state[2]):+6.1f}°)")
+                print(f"         действие: {get_action_name(action)}")
             
             state = next_state
         
