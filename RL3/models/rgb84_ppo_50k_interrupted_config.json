@@ -1,0 +1,12 @@
+{
+  "experiment_name": "rgb84_ppo_50k",
+  "image_size": 84,
+  "use_grayscale": true,
+  "frame_skip": 4,
+  "frame_stack": 4,
+  "total_timesteps": 50000,
+  "n_envs": 4,
+  "use_subproc": true,
+  "algorithm": "PPO",
+  "feature_extractor": "MobileNetV3-Small"
+}

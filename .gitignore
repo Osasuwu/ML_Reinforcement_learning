@@ -1,1 +1,49 @@
-*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+
+# Logs and Databases
+*.log
+*.sql
+*.sqlite
+
+# Модели (слишком большие для git)
+models/*.zip
+!models/.gitkeep
+
+# TensorBoard
+tensorboard/
+
+# Результаты
+*.png
+*.jpg
+*.mp4
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Временные файлы тестов
+logs/
+test_*.png

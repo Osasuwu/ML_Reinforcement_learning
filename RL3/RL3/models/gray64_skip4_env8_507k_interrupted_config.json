@@ -1,0 +1,12 @@
+{
+  "experiment_name": "gray64_skip4_env8_507k",
+  "image_size": 64,
+  "use_grayscale": true,
+  "frame_skip": 4,
+  "frame_stack": 4,
+  "total_timesteps": 507904,
+  "n_envs": 8,
+  "use_subproc": true,
+  "algorithm": "PPO",
+  "feature_extractor": "MobileNetV3-Small"
+}
