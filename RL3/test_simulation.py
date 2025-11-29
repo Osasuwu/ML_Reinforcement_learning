@@ -44,8 +44,8 @@ def test_environment_setup():
         plt.imshow(latest_frame)
     plt.title("Camera View (Latest Frame)")
     plt.axis('off')
-    plt.savefig('RL3/test_camera_view.png')
-    print("✓ Изображение сохранено в 'RL3/test_camera_view.png'")
+    plt.savefig('./RL3/test_camera_view.png')
+    print("✓ Изображение сохранено в './RL3/test_camera_view.png'")
     plt.close()
     
     # Ждем 3 секунды для просмотра GUI
@@ -196,8 +196,8 @@ def test_reward_function():
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('RL3/test_reward_function.png')
-    print("✓ График сохранен в 'RL3/test_reward_function.png'")
+    plt.savefig('./RL3/test_reward_function.png')
+    print("✓ График сохранен в './RL3/test_reward_function.png'")
     plt.close()
     
     env.close()
@@ -224,8 +224,8 @@ def test_grayscale_mode():
     plt.imshow(latest_frame, cmap='gray')
     plt.title("Grayscale Camera View")
     plt.axis('off')
-    plt.savefig('RL3/test_grayscale.png')
-    print("✓ Grayscale изображение сохранено в 'RL3/test_grayscale.png'")
+    plt.savefig('./RL3/test_grayscale.png')
+    print("✓ Grayscale изображение сохранено в './RL3/test_grayscale.png'")
     plt.close()
     
     env.close()

@@ -1,6 +1,10 @@
 """
 Визуальная среда для обучения робота Franka Panda управлению на основе изображений с камеры.
-Задача: перенести объект в целевую точку.
+
+Поддерживает 3 режима обучения (curriculum learning):
+  - "reach": Дотянуться до объекта (самая простая задача)
+  - "grasp": Дотянуться и схватить объект  
+  - "transfer": Схватить и перенести объект к цели (полная задача)
 """
 import numpy as np
 import pybullet as p
@@ -15,13 +19,16 @@ class RobotArmEnv(gym.Env):
     Среда для обучения роботизированного манипулятора Franka Panda
     с использованием визуального входа (изображения с камеры).
     
-    Задача: схватить объект и перенести его в целевую зону (зелёный маркер).
+    Режимы задач:
+      - "reach": Только дотянуться до объекта (для начального обучения)
+      - "grasp": Дотянуться и схватить объект
+      - "transfer": Полная задача - схватить и перенести к цели
     """
     
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
     
     def __init__(self, render_mode=None, use_gui=False, image_size=84, use_grayscale=False, 
-                 frame_skip=4, frame_stack=4):
+                 frame_skip=4, frame_stack=4, task="reach"):
         """
         Args:
             render_mode: Режим рендеринга ('human' или 'rgb_array')
@@ -30,6 +37,7 @@ class RobotArmEnv(gym.Env):
             use_grayscale: Использовать ли grayscale вместо RGB
             frame_skip: Количество повторений одного действия
             frame_stack: Количество последних кадров для стекинга
+            task: Режим задачи ("reach", "grasp", "transfer")
         """
         super().__init__()
         
@@ -39,12 +47,13 @@ class RobotArmEnv(gym.Env):
         self.use_grayscale = use_grayscale
         self.frame_skip = frame_skip
         self.frame_stack = frame_stack
+        self.task = task  # Режим задачи
         
-        # Параметры камеры (Eye-to-hand: камера над столом)
-        self.camera_distance = 1.2  # Немного дальше, чтобы видеть и объект и цель
-        self.camera_yaw = 0
-        self.camera_pitch = -50  # Более крутой угол для лучшего обзора
-        self.camera_target = [0.5, 0.0, 0.0]
+        # Параметры камеры (Eye-to-hand: камера над столом, хороший обзор)
+        self.camera_distance = 1.0  # Ближе к сцене
+        self.camera_yaw = 45  # Угол для лучшего 3D восприятия
+        self.camera_pitch = -45  # Смотрим сверху-сбоку
+        self.camera_target = [0.5, 0.0, 0.15]  # Центр рабочей зоны, чуть выше стола
         
         # Кэширование матриц камеры (вычисляем один раз!)
         self._view_matrix = None
@@ -62,7 +71,7 @@ class RobotArmEnv(gym.Env):
         self.workspace_limits = {
             'x': [0.3, 0.7],
             'y': [-0.3, 0.3],
-            'z': [0.02, 0.4]
+            'z': [0.05, 0.4]  # Минимум 0.05 - не даём опускаться к полу!
         }
         
         # Инициализация PyBullet
@@ -456,10 +465,12 @@ class RobotArmEnv(gym.Env):
     
     def _compute_reward(self):
         """
-        Вычисление награды для задачи переноса объекта.
+        Вычисление награды в зависимости от режима задачи.
         
-        Фаза 1: Подойти к объекту и схватить
-        Фаза 2: Перенести объект к цели
+        Режимы:
+          - "reach": Дотянуться до объекта (простая задача для начала)
+          - "grasp": Дотянуться и схватить объект
+          - "transfer": Схватить и перенести объект к цели
         """
         ee_pos = self._get_end_effector_pos()
         obj_pos = self._get_object_pos()
@@ -467,62 +478,132 @@ class RobotArmEnv(gym.Env):
         reward = 0.0
         terminated = False
         
-        # Расстояния
-        dist_ee_to_obj = np.linalg.norm(ee_pos - obj_pos)
-        dist_obj_to_goal = np.linalg.norm(obj_pos[:2] - self.goal_pos[:2])  # Только XY
+        # Базовые расстояния
+        dist_3d = np.linalg.norm(ee_pos - obj_pos)  # 3D расстояние до объекта
+        dist_xy = np.linalg.norm(ee_pos[:2] - obj_pos[:2])  # XY расстояние
+        dist_obj_to_goal = np.linalg.norm(obj_pos[:2] - self.goal_pos[:2])
         
-        if not self.object_grasped:
-            # === ФАЗА 1: Приближение и захват ===
+        # Проверка контакта
+        contact = self._check_grasp()
+        
+        if self.task == "reach":
+            # ========== ЗАДАЧА 1: REACH (дотянуться) ==========
+            # Простейшая задача - просто коснуться объекта
             
-            # Награда за приближение к объекту
-            reward -= 5.0 * dist_ee_to_obj  # Dense reward
+            # Dense reward: приближение к объекту
+            reward = -dist_3d * 10.0
             
             # Бонус за улучшение
             if self.prev_distance_to_obj is not None:
-                improvement = self.prev_distance_to_obj - dist_ee_to_obj
-                reward += improvement * 30.0
-            self.prev_distance_to_obj = dist_ee_to_obj
-            
-            # Большой бонус за захват!
-            if self._check_grasp():
-                reward += 100.0
-                
-            # Бонус за близость
-            if dist_ee_to_obj < 0.05:
-                reward += 20.0
-            elif dist_ee_to_obj < 0.1:
-                reward += 10.0
-                
-        else:
-            # === ФАЗА 2: Перенос к цели ===
-            
-            # Награда за приближение объекта к цели
-            reward -= 5.0 * dist_obj_to_goal
-            
-            # Бонус за прогресс
-            if self.prev_distance_obj_to_goal is not None:
-                improvement = self.prev_distance_obj_to_goal - dist_obj_to_goal
+                improvement = self.prev_distance_to_obj - dist_3d
                 reward += improvement * 50.0
-            self.prev_distance_obj_to_goal = dist_obj_to_goal
+            self.prev_distance_to_obj = dist_3d
             
-            # Бонус за удержание объекта
-            reward += 5.0
+            # Бонусы за близость
+            if dist_3d < 0.15:
+                reward += 5.0
+            if dist_3d < 0.1:
+                reward += 10.0
+            if dist_3d < 0.05:
+                reward += 20.0
             
-            # Проверка успешного переноса
-            if dist_obj_to_goal < 0.05:  # Объект в целевой зоне!
-                reward += 200.0
-                terminated = True  # Успех!
+            # УСПЕХ: касание объекта!
+            if contact:
+                reward += 100.0
+                terminated = True
+                
+        elif self.task == "grasp":
+            # ========== ЗАДАЧА 2: GRASP (схватить) ==========
+            # Дотянуться СВЕРХУ и схватить объект
+            
+            if not self.object_grasped:
+                # Целевая высота - чуть выше объекта
+                target_height = obj_pos[2] + 0.06
+                height_error = abs(ee_pos[2] - target_height)
+                
+                # Награда за XY приближение
+                reward -= dist_xy * 5.0
+                
+                # Награда за правильную высоту
+                reward -= height_error * 3.0
+                
+                # Бонус за улучшение XY
+                if self.prev_distance_to_obj is not None:
+                    improvement = self.prev_distance_to_obj - dist_xy
+                    reward += improvement * 30.0
+                self.prev_distance_to_obj = dist_xy
+                
+                # Бонусы за хорошую позицию
+                if dist_xy < 0.1 and height_error < 0.1:
+                    reward += 10.0
+                if dist_xy < 0.05 and height_error < 0.05:
+                    reward += 25.0
+                
+                # УСПЕХ: объект схвачен!
+                if contact:
+                    reward += 150.0
+                    terminated = True
+            else:
+                # Объект уже схвачен - успех
+                reward += 50.0
+                terminated = True
+                
+        else:  # task == "transfer"
+            # ========== ЗАДАЧА 3: TRANSFER (перенести) ==========
+            # Полная задача: схватить и перенести к цели
+            
+            if not self.object_grasped:
+                # Фаза 1: Приближение к объекту
+                target_height = obj_pos[2] + 0.06
+                height_error = abs(ee_pos[2] - target_height)
+                
+                reward -= dist_xy * 3.0
+                reward -= height_error * 2.0
+                
+                if self.prev_distance_to_obj is not None:
+                    improvement = self.prev_distance_to_obj - dist_xy
+                    reward += improvement * 20.0
+                self.prev_distance_to_obj = dist_xy
+                
+                if dist_xy < 0.05 and height_error < 0.05:
+                    reward += 15.0
+                
+                if contact:
+                    reward += 100.0
+            else:
+                # Фаза 2: Перенос к цели
+                reward -= dist_obj_to_goal * 5.0
+                
+                if self.prev_distance_obj_to_goal is not None:
+                    improvement = self.prev_distance_obj_to_goal - dist_obj_to_goal
+                    reward += improvement * 30.0
+                self.prev_distance_obj_to_goal = dist_obj_to_goal
+                
+                reward += 2.0  # Бонус за удержание
+                
+                if dist_obj_to_goal < 0.1:
+                    reward += 15.0
+                if dist_obj_to_goal < 0.05:
+                    reward += 40.0
+                
+                # УСПЕХ: объект доставлен!
+                if dist_obj_to_goal < 0.04:
+                    reward += 200.0
+                    terminated = True
         
-        # Штраф за время
-        reward -= 0.1
+        # Маленький штраф за время
+        reward -= 0.02
         
         info = {
-            'distance_to_object': dist_ee_to_obj,
+            'distance': dist_3d,  # Для совместимости со старым кодом
+            'distance_to_object': dist_3d,
             'distance_to_goal': dist_obj_to_goal,
+            'contact': contact,
             'object_grasped': self.object_grasped,
             'ee_pos': ee_pos,
             'obj_pos': obj_pos,
             'goal_pos': self.goal_pos,
+            'task': self.task,
             'success': terminated
         }
         

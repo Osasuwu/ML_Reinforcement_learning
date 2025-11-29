@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 from robot_visual_env import RobotArmEnv
-from feature_extractor import MobileNetFeatureExtractor
+from feature_extractor import CustomCNNFeatureExtractor
 import matplotlib.pyplot as plt
 import time
 
@@ -41,9 +41,9 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
     # Проверка существования модели
     if not os.path.exists(model_path):
         print(f"❌ Модель не найдена: {model_path}")
-        print("\nДоступные модели в RL3/models/:")
-        if os.path.exists("RL3/models"):
-            models = [f for f in os.listdir("RL3/models") if f.endswith('.zip')]
+        print("\nДоступные модели в ./RL3/models/:")
+        if os.path.exists("./RL3/models"):
+            models = [f for f in os.listdir("./RL3/models") if f.endswith('.zip')]
             for m in models:
                 print(f"  - {m}")
         return
@@ -56,6 +56,7 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
     if config:
         print(f"✓ Конфигурация модели загружена:")
         print(f"  - Эксперимент: {config.get('experiment_name', 'N/A')}")
+        print(f"  - Задача: {config.get('task', 'reach')}")
         print(f"  - Image size: {config.get('image_size', 84)}x{config.get('image_size', 84)}")
         print(f"  - Image mode: {'Grayscale' if config.get('use_grayscale', False) else 'RGB'}")
         print(f"  - Frame skip: {config.get('frame_skip', 4)}")
@@ -67,16 +68,17 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
         use_grayscale = config.get('use_grayscale', False)
         frame_skip = config.get('frame_skip', 4)
         frame_stack = config.get('frame_stack', 4)
+        task = config.get('task', 'reach')
     else:
         print("⚠ Конфигурация не найдена, используются параметры по умолчанию:")
         print("  - Image size: 84x84")
         print("  - Image mode: RGB")
-        print("  - Frame skip: 4")
-        print("  - Frame stack: 4")
+        print("  - Task: reach")
         image_size = 84
         use_grayscale = False
         frame_skip = 4
         frame_stack = 4
+        task = "reach"
     
     # Создание среды с параметрами из конфигурации
     env = RobotArmEnv(
@@ -84,7 +86,8 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
         image_size=image_size,
         use_grayscale=use_grayscale,
         frame_skip=frame_skip,
-        frame_stack=frame_stack
+        frame_stack=frame_stack,
+        task=task
     )
     
     # Загрузка модели
@@ -220,12 +223,12 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
     axes[1, 1].set_title(f'Success Rate: {success_rate:.1f}%')
     
     plt.tight_layout()
-    plt.savefig('RL3/test_results.png', dpi=150)
-    print("✓ Графики сохранены в RL3/test_results.png")
+    plt.savefig('./RL3/test_results.png', dpi=150)
+    print("✓ Графики сохранены в ./RL3/test_results.png")
     plt.close()
     
     # Сохранение детальной статистики
-    stats_path = 'RL3/test_statistics.txt'
+    stats_path = './RL3/test_statistics.txt'
     with open(stats_path, 'w', encoding='utf-8') as f:
         f.write("РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ ОБУЧЕННОЙ МОДЕЛИ\n")
         f.write("=" * 60 + "\n\n")
@@ -252,19 +255,19 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
 
 def test_best_model(n_episodes=10, use_gui=True):
     """Тестирование лучшей модели"""
-    best_model_path = "RL3/models/best_model.zip"
+    best_model_path = "./RL3/models/best_model.zip"
     if os.path.exists(best_model_path):
         test_model(best_model_path, n_episodes, use_gui)
     else:
         print(f"❌ Лучшая модель не найдена: {best_model_path}")
         print("\nПопробуйте использовать финальную модель:")
-        final_model_path = "RL3/models/ppo_robot_visual_final.zip"
+        final_model_path = "./RL3/models/ppo_robot_visual_final.zip"
         if os.path.exists(final_model_path):
             test_model(final_model_path, n_episodes, use_gui)
         else:
             print(f"❌ Финальная модель также не найдена: {final_model_path}")
             print("\nСначала обучите модель, запустив:")
-            print("  python RL3/train_visual_robot.py")
+            print("  python ./RL3/train_visual_robot.py")
 
 
 def interactive_test():
@@ -274,7 +277,7 @@ def interactive_test():
     print("=" * 60)
     
     # Список доступных моделей
-    models_dir = "RL3/models"
+    models_dir = "./RL3/models"
     if not os.path.exists(models_dir):
         print(f"❌ Директория моделей не найдена: {models_dir}")
         return
