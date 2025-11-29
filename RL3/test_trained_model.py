@@ -98,6 +98,7 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
     episode_lengths = []
     success_count = 0
     min_distances = []
+    grasp_count = 0  # Новая метрика
     
     for episode in range(n_episodes):
         obs, info = env.reset()
@@ -105,6 +106,7 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
         episode_length = 0
         done = False
         min_dist = float('inf')
+        episode_grasped = False
         
         print(f"Эпизод {episode + 1}/{n_episodes}")
         
@@ -119,26 +121,36 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
             episode_reward += reward
             episode_length += 1
             
-            # Отслеживание минимального расстояния
-            if info['distance'] < min_dist:
-                min_dist = info['distance']
+            # Отслеживание метрик
+            dist_to_obj = info.get('distance_to_object', info.get('distance', float('inf')))
+            if dist_to_obj < min_dist:
+                min_dist = dist_to_obj
+            
+            if info.get('object_grasped', False):
+                episode_grasped = True
             
             # Вывод информации каждые 20 шагов
             if episode_length % 20 == 0 or done:
+                grasped_str = "✓" if info.get('object_grasped', False) else "✗"
+                dist_goal = info.get('distance_to_goal', 0)
                 print(f"  Шаг {episode_length}: "
                       f"Reward={reward:.2f}, "
-                      f"Distance={info['distance']:.4f}, "
-                      f"Contact={info['contact']}")
+                      f"DistObj={dist_to_obj:.4f}, "
+                      f"DistGoal={dist_goal:.4f}, "
+                      f"Grasped={grasped_str}")
             
             if use_gui:
                 time.sleep(0.01)  # Замедление для визуализации
         
-        # Проверка успеха
-        if info['contact']:
+        # Проверка успеха (объект доставлен в цель)
+        if info.get('success', False):
             success_count += 1
-            print(f"  ✓ УСПЕХ: Контакт достигнут!")
+            print(f"  ✓ УСПЕХ: Объект доставлен в цель!")
+        elif episode_grasped:
+            grasp_count += 1
+            print(f"  ~ Частичный успех: Объект схвачен, но не доставлен. DistGoal: {info.get('distance_to_goal', 0):.4f}")
         else:
-            print(f"  ✗ Контакт не достигнут. Min distance: {min_dist:.4f}")
+            print(f"  ✗ Неудача. Min distance to obj: {min_dist:.4f}")
         
         print(f"  Итого: Reward={episode_reward:.2f}, Length={episode_length}\n")
         
@@ -154,12 +166,14 @@ def test_model(model_path, n_episodes=10, use_gui=True, record_video=False):
     print("=" * 60)
     
     success_rate = (success_count / n_episodes) * 100
+    grasp_rate = ((success_count + grasp_count) / n_episodes) * 100
     
     print(f"\nОбщая статистика:")
-    print(f"  - Успешных эпизодов: {success_count}/{n_episodes} ({success_rate:.1f}%)")
+    print(f"  - Полный успех (доставка): {success_count}/{n_episodes} ({success_rate:.1f}%)")
+    print(f"  - Схватил объект: {success_count + grasp_count}/{n_episodes} ({grasp_rate:.1f}%)")
     print(f"  - Средняя награда: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
     print(f"  - Средняя длина: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}")
-    print(f"  - Среднее мин. расстояние: {np.mean(min_distances):.4f} ± {np.std(min_distances):.4f}")
+    print(f"  - Среднее мин. расстояние до объекта: {np.mean(min_distances):.4f} ± {np.std(min_distances):.4f}")
     print(f"  - Лучшая награда: {max(episode_rewards):.2f}")
     print(f"  - Худшая награда: {min(episode_rewards):.2f}")
     

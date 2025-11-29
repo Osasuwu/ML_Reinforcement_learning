@@ -107,7 +107,6 @@ def train():
     print("=" * 60)
     
     # ========== ПАРАМЕТРЫ ЭКСПЕРИМЕНТА ==========
-    # 🔥 МЕНЯЙТЕ ТОЛЬКО ЭТИ ПАРАМЕТРЫ - ВСЁ ОСТАЛЬНОЕ НАСТРОИТСЯ АВТОМАТИЧЕСКИ! 🔥
     
     # Параметры среды
     IMAGE_SIZE = 84  # Размер изображения: 64 (быстро), 84 (стандарт), 128 (медленно)
@@ -139,9 +138,9 @@ def train():
     EXPERIMENT_NAME = f"{mode}{IMAGE_SIZE}_skip{FRAME_SKIP}_env{N_ENVS}_{timesteps_k}k"
     
     # Директории (организованы по экспериментам)
-    models_dir = "RL3/models"
-    logs_dir = f"RL3/logs/{EXPERIMENT_NAME}"
-    tensorboard_dir = f"RL3/tensorboard/{EXPERIMENT_NAME}"
+    models_dir = ".\\RL3\\models"
+    logs_dir = f".\\RL3\\logs\\{EXPERIMENT_NAME}"
+    tensorboard_dir = f".\\RL3\\tensorboard\\{EXPERIMENT_NAME}"
     
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
@@ -150,6 +149,7 @@ def train():
     # Конфигурация модели для сохранения
     model_config = {
         "experiment_name": EXPERIMENT_NAME,
+        "task": "pick_and_place",  # Задача переноса объекта
         "image_size": IMAGE_SIZE,
         "use_grayscale": USE_GRAYSCALE,
         "frame_skip": FRAME_SKIP,
@@ -158,15 +158,20 @@ def train():
         "n_envs": N_ENVS,
         "use_subproc": USE_SUBPROC,
         "algorithm": "PPO",
-        "feature_extractor": "MobileNetV3-Small"
+        "feature_extractor": "MobileNetV3-Small",
+        "action_space": "4D (dx, dy, dz, gripper)"
     }
     
     print(f"\n📊 ЭКСПЕРИМЕНТ: {EXPERIMENT_NAME}")
+    print(f"\n🎯 ЗАДАЧА: Перенос объекта в целевую точку")
+    print(f"   Фаза 1: Подойти и схватить объект (красный куб)")
+    print(f"   Фаза 2: Перенести объект к цели (зелёный маркер)")
     print(f"\nПараметры среды:")
     print(f"  - Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
     print(f"  - Image mode: {'Grayscale (1 канал)' if USE_GRAYSCALE else 'RGB (3 канала)'}")
     print(f"  - Frame skip: {FRAME_SKIP}")
     print(f"  - Frame stack: {FRAME_STACK}")
+    print(f"  - Action space: 4D (dx, dy, dz, gripper)")
     print(f"\nПараметры обучения:")
     print(f"  - Total timesteps: {TOTAL_TIMESTEPS:,}")
     print(f"  - Parallel environments: {N_ENVS}")
