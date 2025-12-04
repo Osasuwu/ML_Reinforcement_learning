@@ -190,7 +190,7 @@ class PeriodicRenderCallback(BaseCallback):
         
         # Запускаем новый процесс рендера в отдельном окне консоли
         # start с заголовком окна выводит его на передний план
-        cmd = f'start "=== ROBOT RENDER TEST ===" cmd /c "python \\"{test_script}\\" \\"{model_path}\\" --episodes {self.render_episodes} --gui && pause"'
+        cmd = f'start "=== ROBOT RENDER TEST ===" cmd /c "python \\"{test_script}\\" \\"{model_path}\\" --episodes {self.render_episodes} --gui"'
         
         try:
             # Используем shell=True с start для создания активного окна
