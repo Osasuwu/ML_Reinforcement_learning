@@ -1,6 +1,8 @@
 """
-Custom Feature Extractor с Transfer Learning для Stable-Baselines3.
-Использует предобученную MobileNetV3-Small для извлечения признаков из изображений.
+Feature Extractor с предобученной моделью.
+
+Использует MobileNetV3-Small или EfficientNet-B0 с заморозкой первых слоёв.
+Вход: только пиксели (64x64 grayscale, стек кадров)
 """
 import torch
 import torch.nn as nn
@@ -10,220 +12,249 @@ from gymnasium import spaces
 import numpy as np
 
 
-class MobileNetFeatureExtractor(BaseFeaturesExtractor):
+class MobileNetExtractor(BaseFeaturesExtractor):
     """
-    Feature Extractor с использованием предобученной MobileNetV3-Small.
-    Веса сверточной части заморожены, обучается только голова.
+    Feature Extractor на основе MobileNetV3-Small.
+    
+    Предобученная модель с частичной заморозкой слоёв.
+    Преобразует grayscale изображения в 3-канальные для MobileNet.
     """
     
-    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256, 
+                 freeze_layers: int = 8):
         """
         Args:
-            observation_space: Пространство наблюдений (Dict с 'image' и 'joints')
-            features_dim: Размерность выходного вектора признаков
+            observation_space: Пространство наблюдений
+            features_dim: Размер выходного вектора признаков
+            freeze_layers: Сколько слоёв заморозить (0 = не замораживать)
         """
-        # Вычисляем общую размерность признаков
         super().__init__(observation_space, features_dim)
         
-        # Получаем frame_stack из observation_space
-        image_shape = observation_space['image'].shape
-        self.frame_stack = image_shape[0]
+        # observation_space.shape = (frame_stack, H, W, n_cameras)
+        self.frame_stack = observation_space.shape[0]
+        self.height = observation_space.shape[1]
+        self.width = observation_space.shape[2]
+        self.n_cameras = observation_space.shape[3]
         
-        # Загрузка предобученной MobileNetV3-Small
-        mobilenet = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+        # Загружаем предобученную MobileNetV3-Small
+        mobilenet = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
         
-        # Удаляем классификатор, оставляем только feature extractor
-        self.cnn = nn.Sequential(*list(mobilenet.children())[:-1])  # Убираем последний слой
+        # Модифицируем первый слой для нашего входа
+        # Оригинальный вход: 3 канала
+        # Наш вход: frame_stack * n_cameras каналов (grayscale кадры)
+        in_channels = self.frame_stack * self.n_cameras
         
-        # Полная заморозка для скорости (GPU будет работать только с FC слоями)
-        for param in self.cnn.parameters():
-            param.requires_grad = False
+        # Заменяем первый conv слой
+        original_conv = mobilenet.features[0][0]
+        mobilenet.features[0][0] = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=original_conv.bias is not None
+        )
         
-        # Переводим в eval режим для ускорения
-        self.cnn.eval()
+        # Инициализируем новые веса усреднением оригинальных RGB весов
+        with torch.no_grad():
+            # Среднее по RGB каналам
+            avg_weights = original_conv.weight.data.mean(dim=1, keepdim=True)
+            # Повторяем для всех наших входных каналов
+            mobilenet.features[0][0].weight.data = avg_weights.repeat(1, in_channels, 1, 1)
         
-        # Добавляем AdaptiveAvgPool для фиксированного размера вывода
+        # Берём только features (без classifier)
+        self.features = mobilenet.features
+        
+        # Замораживаем первые слои
+        if freeze_layers > 0:
+            for i, layer in enumerate(self.features):
+                if i < freeze_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+            print(f"  Заморожено {freeze_layers} слоёв из {len(self.features)}")
+        
+        # Adaptive pooling для фиксированного размера выхода
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         
-        # Размерность выхода MobileNetV3-Small
-        mobilenet_out_dim = 576
+        # Вычисляем размер выхода features
+        with torch.no_grad():
+            sample = torch.zeros(1, in_channels, self.height, self.width)
+            out = self.features(sample)
+            feature_size = out.shape[1]
         
-        # Размерность входа джоинтов
-        joints_dim = observation_space['joints'].shape[0]
-        
-        # Размерность признаков: последний кадр (576) + motion features (576 * (frame_stack-1))
-        # Итого: 576 * frame_stack
-        total_cnn_features = mobilenet_out_dim * self.frame_stack
-        
-        # Обучаемая голова (Policy Head) - увеличенная для большей загрузки GPU
+        # FC голова
         self.fc = nn.Sequential(
-            nn.Linear(total_cnn_features + joints_dim, 1024),
+            nn.Linear(feature_size, 512),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Регуляризация
-            nn.Linear(1024, 512),
-            nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(512, features_dim),
             nn.ReLU()
         )
         
-        self.mobilenet_out_dim = mobilenet_out_dim
-        self.joints_dim = joints_dim
+        # Подсчёт параметров
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
-        # Кэшируем тензоры нормализации (создаются при первом forward pass)
-        self._norm_mean = None
-        self._norm_std = None
+        print(f"MobileNetExtractor создан:")
+        print(f"  - Input: {in_channels} каналов, {self.height}x{self.width}")
+        print(f"  - Feature size: {feature_size}")
+        print(f"  - Output: {features_dim}")
+        print(f"  - Total params: {total_params:,}")
+        print(f"  - Trainable params: {trainable_params:,}")
+    
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # observations: (batch, frame_stack, H, W, n_cameras)
+        batch_size = observations.shape[0]
         
-    def forward(self, observations: dict) -> torch.Tensor:
-        """
-        Прямой проход через сеть.
+        # Reshape: (batch, frame_stack * n_cameras, H, W)
+        x = observations.permute(0, 1, 4, 2, 3)  # (batch, frame_stack, n_cameras, H, W)
+        x = x.reshape(batch_size, -1, self.height, self.width)
         
-        Args:
-            observations: Словарь с 'image' и 'joints'
-            
-        Returns:
-            Вектор признаков размерности features_dim
-        """
-        # Извлечение изображений и джоинтов
-        images = observations['image']
-        joints = observations['joints']
+        # Нормализация [0, 255] -> [0, 1]
+        x = x.float() / 255.0
         
-        # images: (batch, frame_stack, height, width, channels)
-        batch_size = images.shape[0]
-        frame_stack = images.shape[1]
-        height = images.shape[2]
-        width = images.shape[3]
-        channels = images.shape[4]
+        # MobileNet features
+        x = self.features(x)
+        x = self.pool(x)
+        x = x.flatten(1)
         
-        # Переставляем оси: (batch, frame_stack, height, width, channels) -> 
-        # (batch, frame_stack, channels, height, width)
-        images = images.permute(0, 1, 4, 2, 3).float() / 255.0
+        # FC
+        x = self.fc(x)
         
-        # ЭФФЕКТИВНЫЙ BATCH PROCESSING: 
-        # Обрабатываем все кадры за один проход через MobileNet
-        # Reshape: (batch, frame_stack, channels, H, W) -> (batch * frame_stack, channels, H, W)
-        images_flat = images.reshape(batch_size * frame_stack, channels, height, width)
-        
-        # Преобразование grayscale -> RGB для MobileNet
-        if channels == 1:
-            images_flat = images_flat.repeat(1, 3, 1, 1)  # (batch*frame_stack, 3, H, W)
-        
-        # Нормализация ImageNet (кэшируем тензоры для скорости)
-        if self._norm_mean is None or self._norm_mean.device != images_flat.device:
-            self._norm_mean = torch.tensor([0.485, 0.456, 0.406], device=images_flat.device).view(1, 3, 1, 1)
-            self._norm_std = torch.tensor([0.229, 0.224, 0.225], device=images_flat.device).view(1, 3, 1, 1)
-        
-        images_flat = (images_flat - self._norm_mean) / self._norm_std
-        
-        # Один проход через замороженную CNN для всех кадров
-        with torch.no_grad():
-            all_features = self.cnn(images_flat)  # (batch*frame_stack, 576, h', w')
-            all_features = self.pool(all_features)  # (batch*frame_stack, 576, 1, 1)
-            all_features = all_features.flatten(1)  # (batch*frame_stack, 576)
-        
-        # Reshape обратно: (batch*frame_stack, 576) -> (batch, frame_stack, 576)
-        all_features = all_features.reshape(batch_size, frame_stack, self.mobilenet_out_dim)
-        
-        # Объединяем признаки всех кадров для понимания движения:
-        # Последний кадр (текущее состояние) + дельты между кадрами (motion)
-        current_features = all_features[:, -1, :]  # (batch, 576) - последний кадр
-        
-        # Motion features: разница между последовательными кадрами
-        motion_features = []
-        for i in range(1, frame_stack):
-            delta = all_features[:, i, :] - all_features[:, i-1, :]
-            motion_features.append(delta)
-        
-        # Конкатенируем: текущий кадр + motion features
-        if motion_features:
-            motion_combined = torch.cat(motion_features, dim=1)  # (batch, 576 * (frame_stack-1))
-            cnn_features = torch.cat([current_features, motion_combined], dim=1)  # (batch, 576 * frame_stack)
-        else:
-            cnn_features = current_features
-        
-        # Нормализация джоинтов
-        joints = joints.float()
-        
-        # Объединяем признаки изображения и джоинтов
-        combined = torch.cat([cnn_features, joints], dim=1)
-        
-        # Пропускаем через обучаемую голову
-        features = self.fc(combined)
-        
-        return features
+        return x
 
 
-class CustomCNNFeatureExtractor(BaseFeaturesExtractor):
+class EfficientNetExtractor(BaseFeaturesExtractor):
     """
-    Простая custom CNN для сравнения (легкая архитектура).
-    Обучается с нуля.
+    Feature Extractor на основе EfficientNet-B0.
+    
+    Более мощная модель, но требует больше памяти.
     """
     
-    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256,
+                 freeze_layers: int = 4):
         super().__init__(observation_space, features_dim)
         
-        # Получаем размеры
-        image_shape = observation_space['image'].shape
-        joints_dim = observation_space['joints'].shape[0]
+        self.frame_stack = observation_space.shape[0]
+        self.height = observation_space.shape[1]
+        self.width = observation_space.shape[2]
+        self.n_cameras = observation_space.shape[3]
         
-        # image_shape: (frame_stack, height, width, channels)
-        frame_stack = image_shape[0]
-        height = image_shape[1]
-        width = image_shape[2]
-        channels = image_shape[3]
+        in_channels = self.frame_stack * self.n_cameras
         
-        # Входные каналы: frame_stack * channels
-        in_channels = frame_stack * channels
+        # Загружаем EfficientNet-B0
+        efficientnet = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
         
-        # Простая CNN (Nature CNN style)
+        # Модифицируем первый слой
+        original_conv = efficientnet.features[0][0]
+        efficientnet.features[0][0] = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=original_conv.bias is not None
+        )
+        
+        with torch.no_grad():
+            avg_weights = original_conv.weight.data.mean(dim=1, keepdim=True)
+            efficientnet.features[0][0].weight.data = avg_weights.repeat(1, in_channels, 1, 1)
+        
+        self.features = efficientnet.features
+        
+        # Заморозка
+        if freeze_layers > 0:
+            for i, layer in enumerate(self.features):
+                if i < freeze_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+        
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        with torch.no_grad():
+            sample = torch.zeros(1, in_channels, self.height, self.width)
+            out = self.features(sample)
+            feature_size = out.shape[1]
+        
+        self.fc = nn.Sequential(
+            nn.Linear(feature_size, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, features_dim),
+            nn.ReLU()
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        print(f"EfficientNetExtractor создан:")
+        print(f"  - Input: {in_channels} каналов, {self.height}x{self.width}")
+        print(f"  - Feature size: {feature_size}")
+        print(f"  - Output: {features_dim}")
+        print(f"  - Total params: {total_params:,}")
+        print(f"  - Trainable params: {trainable_params:,}")
+    
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        batch_size = observations.shape[0]
+        
+        x = observations.permute(0, 1, 4, 2, 3)
+        x = x.reshape(batch_size, -1, self.height, self.width)
+        x = x.float() / 255.0
+        
+        x = self.features(x)
+        x = self.pool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        
+        return x
+
+
+class SimpleCNNExtractor(BaseFeaturesExtractor):
+    """
+    Простая CNN без предобучения (для сравнения).
+    """
+    
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        
+        self.frame_stack = observation_space.shape[0]
+        self.height = observation_space.shape[1]
+        self.width = observation_space.shape[2]
+        self.n_cameras = observation_space.shape[3]
+        
+        in_channels = self.frame_stack * self.n_cameras
+        
         self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten()
         )
         
-        # Вычисляем размер выхода CNN
         with torch.no_grad():
-            sample = torch.zeros(1, in_channels, height, width)
-            cnn_out_size = self.cnn(sample).shape[1]
+            sample = torch.zeros(1, in_channels, self.height, self.width)
+            cnn_out = self.cnn(sample).shape[1]
         
-        # Полносвязные слои
         self.fc = nn.Sequential(
-            nn.Linear(cnn_out_size + joints_dim, 512),
+            nn.Linear(cnn_out, 256),
             nn.ReLU(),
-            nn.Linear(512, features_dim),
+            nn.Linear(256, features_dim),
             nn.ReLU()
         )
         
-        self.cnn_out_size = cnn_out_size
-        self.joints_dim = joints_dim
+        print(f"SimpleCNNExtractor: {in_channels} channels -> {cnn_out} -> {features_dim}")
+    
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        batch_size = observations.shape[0]
         
-    def forward(self, observations: dict) -> torch.Tensor:
-        images = observations['image']
-        joints = observations['joints']
+        x = observations.permute(0, 1, 4, 2, 3)
+        x = x.reshape(batch_size, -1, self.height, self.width)
+        x = x.float() / 255.0
         
-        # Преобразование изображений
-        batch_size = images.shape[0]
-        frame_stack = images.shape[1]
-        height = images.shape[2]
-        width = images.shape[3]
-        channels = images.shape[4]
+        x = self.cnn(x)
+        x = self.fc(x)
         
-        images = images.permute(0, 1, 4, 2, 3)
-        images = images.reshape(batch_size, frame_stack * channels, height, width)
-        images = images.float() / 255.0
-        
-        # CNN
-        cnn_features = self.cnn(images)
-        
-        # Объединение с джоинтами
-        joints = joints.float()
-        combined = torch.cat([cnn_features, joints], dim=1)
-        
-        # FC
-        features = self.fc(combined)
-        
-        return features
+        return x

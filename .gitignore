@@ -23,8 +23,11 @@ ENV/
 *.sqlite
 
 # Модели (слишком большие для git)
-models/*.zip
-!models/.gitkeep
+RL3/models/*.zip
+RL3/models/*.json
+RL3/models/.gitkeep
+!RL3/models/*_final.zip
+!RL3/models/*_final_config.json
 
 # TensorBoard
 tensorboard/
@@ -47,3 +50,5 @@ Thumbs.db
 # Временные файлы тестов
 logs/
 test_*.png
+
+
