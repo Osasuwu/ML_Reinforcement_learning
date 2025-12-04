@@ -56,16 +56,18 @@ class RobotEnv(gym.Env):
         # PyBullet
         if self.use_gui:
             self.physics_client = p.connect(p.GUI)
+            # Отключаем лишние GUI элементы (preview окна камер, тени и т.д.)
+            p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
         else:
             self.physics_client = p.connect(p.DIRECT)
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
             
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(1./240.)
-        
-        if not self.use_gui:
-            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
         
         # Индексы джоинтов Franka Panda
         self.arm_joints = [0, 1, 2, 3, 4, 5, 6]  # 7 джоинтов руки
@@ -79,16 +81,38 @@ class RobotEnv(gym.Env):
         # Начальные углы (рука над столом)
         self.home_position = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
         
-        # Observation space: только изображения!
-        # Формат: (frame_stack, height, width, n_cameras)
-        n_cameras = 2 if camera_mode == "both" else 1
-        self.n_cameras = n_cameras
+        # Размер мини-камеры (depth или wrist)
+        self.mini_cam_size = 32  # 32x32 для вторичной камеры
         
-        self.observation_space = spaces.Box(
-            low=0, high=255,
-            shape=(frame_stack, image_size, image_size, n_cameras),
-            dtype=np.uint8
-        )
+        # Observation space: только изображения!
+        # side+depth / side+wrist: Dict с RGB (64x64) и вторичная камера (8x8)
+        if camera_mode in ("side+depth", "side+wrist"):
+            n_cameras = 1  # Основной канал RGB
+            self.n_cameras = n_cameras
+            secondary_key = "depth" if camera_mode == "side+depth" else "wrist"
+            self.secondary_key = secondary_key
+            # Dict space: RGB 64x64 + secondary 32x32
+            self.observation_space = spaces.Dict({
+                'image': spaces.Box(
+                    low=0, high=255,
+                    shape=(frame_stack, image_size, image_size, 1),
+                    dtype=np.uint8
+                ),
+                secondary_key: spaces.Box(
+                    low=0, high=255,
+                    shape=(frame_stack, self.mini_cam_size, self.mini_cam_size, 1),
+                    dtype=np.uint8
+                )
+            })
+        else:  # side only
+            n_cameras = 1
+            self.n_cameras = n_cameras
+            self.secondary_key = None
+            self.observation_space = spaces.Box(
+                low=0, high=255,
+                shape=(frame_stack, image_size, image_size, n_cameras),
+                dtype=np.uint8
+            )
         
         # Action space: delta углов для 7 джоинтов + gripper
         # Маленькие изменения углов за шаг для плавности
@@ -158,16 +182,20 @@ class RobotEnv(gym.Env):
         if self.object_id is not None:
             p.removeBody(self.object_id)
         
-        # Случайная позиция в левой части стола
-        x = np.random.uniform(0.35, 0.55)
-        y = np.random.uniform(-0.15, 0.0)
+        # Случайная позиция на столе (обе стороны, не близко к краям)
+        x = np.random.uniform(0.25, 0.65)
+        # Выбираем левую или правую сторону, не близко к центру
+        if np.random.random() < 0.5:
+            y = np.random.uniform(-0.35, -0.1)  # левая сторона
+        else:
+            y = np.random.uniform(0.1, 0.35)    # правая сторона
         z = 0.025
         
-        # Красный куб
-        collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02])
+        # Белый цилиндр (хорошо виден в grayscale)
+        collision = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.02, height=0.05)
         visual = p.createVisualShape(
-            p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02],
-            rgbaColor=[0.9, 0.1, 0.1, 1]
+            p.GEOM_CYLINDER, radius=0.02, length=0.05,
+            rgbaColor=[1.0, 1.0, 1.0, 1]  # Белый
         )
         self.object_id = p.createMultiBody(
             baseMass=0.05,
@@ -181,21 +209,32 @@ class RobotEnv(gym.Env):
         return self.object_start_pos
     
     def _create_goal(self):
-        """Создание целевой зоны"""
+        """Создание целевой зоны (на противоположной стороне от объекта)"""
         if self.goal_id is not None:
             p.removeBody(self.goal_id)
         
-        # Случайная позиция в правой части стола
-        x = np.random.uniform(0.45, 0.65)
-        y = np.random.uniform(0.05, 0.2)
+        # Генерируем позицию пока она не будет достаточно далеко от объекта
+        min_distance = 0.2
+        for _ in range(50):  # Максимум 50 попыток
+            x = np.random.uniform(0.25, 0.65)
+            # Выбираем сторону, противоположную объекту
+            if self.object_start_pos[1] < 0:
+                y = np.random.uniform(0.1, 0.35)   # правая сторона
+            else:
+                y = np.random.uniform(-0.35, -0.1) # левая сторона
+            
+            # Проверяем расстояние от объекта
+            dist = np.sqrt((x - self.object_start_pos[0])**2 + (y - self.object_start_pos[1])**2)
+            if dist >= min_distance:
+                break
+        
         z = 0.005
         
-        # Зелёный маркер
+        # Тёмный квадрат (хорошо контрастирует с белым объектом в grayscale)
         visual = p.createVisualShape(
-            p.GEOM_CYLINDER,
-            radius=0.04,
-            length=0.01,
-            rgbaColor=[0.1, 0.9, 0.1, 0.7]
+            p.GEOM_BOX,
+            halfExtents=[0.04, 0.04, 0.005],
+            rgbaColor=[0.2, 0.2, 0.2, 0.9]  # Тёмно-серый
         )
         self.goal_id = p.createMultiBody(
             baseMass=0,
@@ -207,13 +246,13 @@ class RobotEnv(gym.Env):
         return self.goal_pos
     
     def _get_side_camera_image(self):
-        """Изображение с боковой камеры"""
+        """Изображение с фронтальной камеры (вид спереди манипулятора)"""
         if self._side_view_matrix is None:
             self._side_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-                cameraTargetPosition=[0.5, 0.0, 0.1],
-                distance=0.9,
-                yaw=45,
-                pitch=-35,
+                cameraTargetPosition=[0.45, 0.0, 0.05],
+                distance=1.0,
+                yaw=90,   # Спереди (смотрит вдоль оси X)
+                pitch=-25,
                 roll=0,
                 upAxisIndex=2
             )
@@ -275,16 +314,124 @@ class RobotEnv(gym.Env):
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         return gray
     
+    def _get_depth_mini_camera_image(self, upscale=False):
+        """
+        Мини-камера 8x8 с угла стола под 45°.
+        Видит ту же сцену что и side камера, но с другого ракурса и в низком разрешении.
+        
+        Args:
+            upscale: если True, возвращает апскейленное изображение (для визуализации)
+                     если False, возвращает 8x8 (для нейросети)
+        """
+        # Камера с противоположной стороны от основной (зеркально)
+        # Основная side: yaw=90 (спереди), эта: yaw=-90 (сзади)
+        view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0.45, 0.0, 0.05],  # Центр рабочей зоны (как у side)
+            distance=1.0,
+            yaw=180,   # С противоположной стороны от основной камеры
+            pitch=-25, # Как у основной камеры
+            roll=0,
+            upAxisIndex=2
+        )
+        
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60, aspect=1.0, nearVal=0.1, farVal=2.0
+        )
+        
+        # Получаем RGB изображение в низком разрешении (8x8)
+        _, _, px, _, _ = p.getCameraImage(
+            width=self.mini_cam_size,
+            height=self.mini_cam_size,
+            viewMatrix=view_matrix,
+            projectionMatrix=proj_matrix,
+            renderer=p.ER_TINY_RENDERER,
+            flags=p.ER_NO_SEGMENTATION_MASK
+        )
+        
+        # RGB -> Grayscale
+        rgb = np.reshape(px, (self.mini_cam_size, self.mini_cam_size, 4))[:, :, :3].astype(np.uint8)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        
+        if upscale:
+            # Апскейлим для визуализации
+            return cv2.resize(
+                gray, 
+                (self.image_size, self.image_size), 
+                interpolation=cv2.INTER_NEAREST
+            )
+        
+        return gray  # 8x8 для нейросети
+    
+    def _get_wrist_mini_camera_image(self, upscale=False):
+        """
+        Мини-камера на клешне 8x8.
+        Видит что прямо под схватом - объект или цель.
+        
+        Args:
+            upscale: если True, возвращает апскейленное изображение (для визуализации)
+                     если False, возвращает 8x8 (для нейросети)
+        """
+        # Получаем позицию и ориентацию end-effector
+        state = p.getLinkState(self.robot_id, self.end_effector_index)
+        ee_pos = np.array(state[0])
+        ee_orn = state[1]
+        
+        # Матрица вращения из кватерниона
+        rot_matrix = np.array(p.getMatrixFromQuaternion(ee_orn)).reshape(3, 3)
+        
+        # Камера смотрит вниз
+        forward = rot_matrix @ np.array([0, 0, 1])
+        up = rot_matrix @ np.array([0, -1, 0])
+        target = ee_pos + forward * 0.3
+        
+        view_matrix = p.computeViewMatrix(
+            cameraEyePosition=ee_pos,
+            cameraTargetPosition=target,
+            cameraUpVector=up
+        )
+        
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=80, aspect=1.0, nearVal=0.02, farVal=1.0
+        )
+        
+        # 8x8 изображение
+        _, _, px, _, _ = p.getCameraImage(
+            width=self.mini_cam_size,
+            height=self.mini_cam_size,
+            viewMatrix=view_matrix,
+            projectionMatrix=proj_matrix,
+            renderer=p.ER_TINY_RENDERER,
+            flags=p.ER_NO_SEGMENTATION_MASK
+        )
+        
+        rgb = np.reshape(px, (self.mini_cam_size, self.mini_cam_size, 4))[:, :, :3].astype(np.uint8)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        
+        if upscale:
+            return cv2.resize(gray, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        
+        return gray  # 8x8 для нейросети
+    
     def _get_camera_images(self):
-        """Получение изображений с камер"""
+        """
+        Получение изображений с камер.
+        Для side+depth/side+wrist возвращает dict.
+        """
         if self.camera_mode == "side":
             return self._get_side_camera_image()[:, :, np.newaxis]
-        elif self.camera_mode == "wrist":
-            return self._get_wrist_camera_image()[:, :, np.newaxis]
-        else:  # both
-            side = self._get_side_camera_image()
-            wrist = self._get_wrist_camera_image()
-            return np.stack([side, wrist], axis=-1)
+        elif self.camera_mode == "side+depth":
+            # Dict: RGB 64x64 + depth 8x8
+            side = self._get_side_camera_image()[:, :, np.newaxis]
+            depth = self._get_depth_mini_camera_image(upscale=False)[:, :, np.newaxis]
+            return {'image': side, 'depth': depth}
+        elif self.camera_mode == "side+wrist":
+            # Dict: RGB 64x64 + wrist 8x8
+            side = self._get_side_camera_image()[:, :, np.newaxis]
+            wrist = self._get_wrist_mini_camera_image(upscale=False)[:, :, np.newaxis]
+            return {'image': side, 'wrist': wrist}
+        else:
+            # Fallback to side only
+            return self._get_side_camera_image()[:, :, np.newaxis]
     
     def _update_frame_buffer(self, images):
         """Обновление буфера кадров"""
@@ -294,10 +441,31 @@ class RobotEnv(gym.Env):
     
     def _get_observation(self):
         """Получение наблюдения (стек кадров)"""
-        while len(self.frame_buffer) < self.frame_stack:
-            self.frame_buffer.append(self.frame_buffer[-1].copy() if self.frame_buffer 
-                                     else np.zeros((self.image_size, self.image_size, self.n_cameras), dtype=np.uint8))
-        return np.array(self.frame_buffer, dtype=np.uint8)
+        if self.camera_mode in ("side+depth", "side+wrist"):
+            # Dict observation
+            sec_key = self.secondary_key  # 'depth' или 'wrist'
+            while len(self.frame_buffer) < self.frame_stack:
+                if self.frame_buffer:
+                    self.frame_buffer.append({
+                        'image': self.frame_buffer[-1]['image'].copy(),
+                        sec_key: self.frame_buffer[-1][sec_key].copy()
+                    })
+                else:
+                    self.frame_buffer.append({
+                        'image': np.zeros((self.image_size, self.image_size, 1), dtype=np.uint8),
+                        sec_key: np.zeros((self.mini_cam_size, self.mini_cam_size, 1), dtype=np.uint8)
+                    })
+            
+            # Stack frames
+            images = np.array([f['image'] for f in self.frame_buffer], dtype=np.uint8)
+            secondary = np.array([f[sec_key] for f in self.frame_buffer], dtype=np.uint8)
+            return {'image': images, sec_key: secondary}
+        else:
+            # Box observation
+            while len(self.frame_buffer) < self.frame_stack:
+                self.frame_buffer.append(self.frame_buffer[-1].copy() if self.frame_buffer 
+                                         else np.zeros((self.image_size, self.image_size, self.n_cameras), dtype=np.uint8))
+            return np.array(self.frame_buffer, dtype=np.uint8)
     
     def _get_ee_pos(self):
         """Позиция end-effector"""

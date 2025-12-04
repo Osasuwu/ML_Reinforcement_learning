@@ -258,3 +258,130 @@ class SimpleCNNExtractor(BaseFeaturesExtractor):
         x = self.fc(x)
         
         return x
+
+
+class MobileNetWithDepthExtractor(BaseFeaturesExtractor):
+    """
+    Feature Extractor для side+depth и side+wrist режимов.
+    
+    Обрабатывает Dict observation space с:
+    - 'image': (frame_stack, 64, 64, 1) - RGB grayscale
+    - 'depth' или 'wrist': (frame_stack, 8, 8, 1) - мини вторичная камера
+    
+    MobileNet для изображения + маленькая FC сеть для вторичной камеры.
+    Экономит память: 64x64 + 8x8 вместо 64x64 + 64x64
+    """
+    
+    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256,
+                 freeze_layers: int = 8):
+        # Для Dict space нужно передать весь features_dim
+        super().__init__(observation_space, features_dim)
+        
+        # Image space
+        image_space = observation_space['image']
+        self.frame_stack = image_space.shape[0]
+        self.image_height = image_space.shape[1]
+        self.image_width = image_space.shape[2]
+        
+        # Secondary space (depth или wrist)
+        # Определяем какой ключ используется
+        self.secondary_key = 'depth' if 'depth' in observation_space.spaces else 'wrist'
+        secondary_space = observation_space[self.secondary_key]
+        self.secondary_size = secondary_space.shape[1]  # 8
+        
+        in_channels_image = self.frame_stack  # 4 кадра grayscale
+        in_channels_secondary = self.frame_stack  # 4 кадра secondary
+        
+        # === MobileNet для изображения ===
+        mobilenet = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+        
+        original_conv = mobilenet.features[0][0]
+        mobilenet.features[0][0] = nn.Conv2d(
+            in_channels=in_channels_image,
+            out_channels=original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=original_conv.bias is not None
+        )
+        
+        with torch.no_grad():
+            avg_weights = original_conv.weight.data.mean(dim=1, keepdim=True)
+            mobilenet.features[0][0].weight.data = avg_weights.repeat(1, in_channels_image, 1, 1)
+        
+        self.image_features = mobilenet.features
+        
+        if freeze_layers > 0:
+            for i, layer in enumerate(self.image_features):
+                if i < freeze_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+        
+        self.image_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        with torch.no_grad():
+            sample = torch.zeros(1, in_channels_image, self.image_height, self.image_width)
+            out = self.image_features(sample)
+            image_feature_size = out.shape[1]
+        
+        # === Маленькая сеть для secondary 8x8 ===
+        # 4 кадра по 8x8 = 256 входных значений, очень мало!
+        self.secondary_net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_channels_secondary * self.secondary_size * self.secondary_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+        secondary_feature_size = 32
+        
+        # === Комбинированная голова ===
+        combined_size = image_feature_size + secondary_feature_size
+        
+        self.fc = nn.Sequential(
+            nn.Linear(combined_size, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, features_dim),
+            nn.ReLU()
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        print(f"MobileNetWithDepthExtractor создан:")
+        print(f"  - Image: {in_channels_image} кадров, {self.image_height}x{self.image_width}")
+        print(f"  - Secondary ({self.secondary_key}): {in_channels_secondary} кадров, {self.secondary_size}x{self.secondary_size}")
+        print(f"  - Image features: {image_feature_size}")
+        print(f"  - Secondary features: {secondary_feature_size}")
+        print(f"  - Combined: {combined_size} -> {features_dim}")
+        print(f"  - Total params: {total_params:,}")
+        print(f"  - Trainable params: {trainable_params:,}")
+        print(f"  - Память secondary: {in_channels_secondary * self.secondary_size * self.secondary_size} значений (vs {in_channels_secondary * self.image_height * self.image_width} если бы 64x64)")
+    
+    def forward(self, observations: dict) -> torch.Tensor:
+        # observations - dict с 'image' и 'depth'/'wrist'
+        images = observations['image']  # (batch, frame_stack, H, W, 1)
+        secondary = observations[self.secondary_key]  # (batch, frame_stack, 8, 8, 1)
+        
+        batch_size = images.shape[0]
+        
+        # === Image branch ===
+        # (batch, frame_stack, H, W, 1) -> (batch, frame_stack, H, W)
+        x_img = images.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.image_height, self.image_width)
+        x_img = x_img.float() / 255.0
+        x_img = self.image_features(x_img)
+        x_img = self.image_pool(x_img)
+        x_img = x_img.flatten(1)
+        
+        # === Secondary branch ===
+        # (batch, frame_stack, 8, 8, 1) -> (batch, frame_stack * 8 * 8)
+        x_sec = secondary.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.secondary_size, self.secondary_size)
+        x_sec = x_sec.float() / 255.0
+        x_sec = self.secondary_net(x_sec)
+        
+        # === Combine ===
+        x = torch.cat([x_img, x_sec], dim=1)
+        x = self.fc(x)
+        
+        return x

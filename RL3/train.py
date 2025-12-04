@@ -24,13 +24,20 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from robot_env import RobotEnv
-from feature_extractor import MobileNetExtractor, EfficientNetExtractor, SimpleCNNExtractor
+from feature_extractor import (MobileNetExtractor, EfficientNetExtractor, 
+                               SimpleCNNExtractor, MobileNetWithDepthExtractor)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train pick-and-place robot')
-    parser.add_argument('--steps', type=int, default=1_000_000,
-                       help='Total timesteps (default: 1M)')
+    parser.add_argument('--steps', type=int, default=10_000_000,
+                       help='Max timesteps (default: 10M)')
+    parser.add_argument('--target-success', type=float, default=80.0,
+                       help='Target success rate %% to stop training (default: 80)')
+    parser.add_argument('--patience', type=int, default=500_000,
+                       help='Stop if no improvement for N steps (default: 500k)')
+    parser.add_argument('--min-steps', type=int, default=1_000_000,
+                       help='Start patience check after N steps (default: 1M)')
     parser.add_argument('--network', type=str, default='mobilenet',
                        choices=['mobilenet', 'efficientnet', 'cnn'],
                        help='Network architecture')
@@ -38,8 +45,8 @@ def parse_args():
                        choices=['ppo', 'sac'],
                        help='RL algorithm')
     parser.add_argument('--camera', type=str, default='side',
-                       choices=['side', 'wrist', 'both'],
-                       help='Camera mode')
+                       choices=['side', 'side+depth', 'side+wrist'],
+                       help='Camera mode (side+depth/wrist adds 8x8 secondary cam)')
     parser.add_argument('--freeze', type=int, default=8,
                        help='Number of layers to freeze in pretrained model')
     parser.add_argument('--n_envs', type=int, default=4,
@@ -105,6 +112,109 @@ class SuccessRateCallback(BaseCallback):
             self.logger.record('rollout/success_rate', success_rate)
         
         return True
+    
+    def get_success_rate(self):
+        """Возвращает текущий success rate"""
+        if len(self.successes) >= 50:
+            return np.mean(self.successes[-100:])
+        return 0.0
+
+
+class EarlyStoppingCallback(BaseCallback):
+    """
+    Останавливает обучение при достижении target success rate 
+    или при отсутствии улучшений (stagnation).
+    
+    Patience начинает считаться только после min_steps (по умолчанию 1M).
+    Также позволяет вручную остановить обучение через файл STOP.
+    """
+    def __init__(self, success_callback, target_success=0.8, patience=500000,
+                 min_steps=1_000_000, check_freq=10000, stop_file="STOP", verbose=1):
+        super().__init__(verbose)
+        self.success_callback = success_callback
+        self.target_success = target_success  # 0.0-1.0
+        self.patience = patience
+        self.min_steps = min_steps  # Patience активируется после этого шага
+        self.check_freq = check_freq
+        self.stop_file = stop_file
+        
+        self.best_success = 0.0
+        self.steps_without_improvement = 0
+        self.last_check_step = 0
+        self.stop_reason = None
+        self.patience_active = False
+        
+    def _on_step(self) -> bool:
+        # Проверяем только каждые check_freq шагов
+        if self.n_calls - self.last_check_step < self.check_freq:
+            return True
+        
+        self.last_check_step = self.n_calls
+        
+        # 1. Проверка файла ручной остановки
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        stop_path = os.path.join(script_dir, self.stop_file)
+        if os.path.exists(stop_path):
+            self.stop_reason = "manual_stop"
+            print(f"\n{'='*60}")
+            print(f"[STOP] Manual stop requested (STOP file found)")
+            print(f"{'='*60}")
+            # Удаляем файл
+            try:
+                os.remove(stop_path)
+            except:
+                pass
+            return False
+        
+        # Получаем текущий success rate
+        current_success = self.success_callback.get_success_rate()
+        
+        # 2. Проверка достижения цели
+        if current_success >= self.target_success:
+            self.stop_reason = "target_reached"
+            print(f"\n{'='*60}")
+            print(f"[SUCCESS] TARGET REACHED!")
+            print(f"  Current success rate: {current_success*100:.1f}%")
+            print(f"  Target: {self.target_success*100:.1f}%")
+            print(f"  Steps: {self.num_timesteps:,}")
+            print(f"{'='*60}")
+            return False
+        
+        # 3. Активация patience после min_steps
+        if not self.patience_active and self.num_timesteps >= self.min_steps:
+            self.patience_active = True
+            self.best_success = current_success
+            self.steps_without_improvement = 0
+            if self.verbose:
+                print(f"\n  [Patience activated at {self.num_timesteps:,} steps]")
+                print(f"  Current best: {self.best_success*100:.1f}%")
+        
+        # 4. Проверка улучшения (только если patience активен)
+        if self.patience_active:
+            if current_success > self.best_success + 0.01:  # +1% improvement
+                self.best_success = current_success
+                self.steps_without_improvement = 0
+                if self.verbose:
+                    print(f"\n  [Improvement] Best success rate: {self.best_success*100:.1f}%")
+            else:
+                self.steps_without_improvement += self.check_freq
+            
+            # 5. Проверка stagnation
+            if self.steps_without_improvement >= self.patience:
+                self.stop_reason = "stagnation"
+                print(f"\n{'='*60}")
+                print(f"[STOP] Training stagnated!")
+                print(f"  No improvement for {self.patience:,} steps (after {self.min_steps:,})")
+                print(f"  Best success rate: {self.best_success*100:.1f}%")
+                print(f"  Current: {current_success*100:.1f}%")
+                print(f"{'='*60}")
+                return False
+        
+        return True
+    
+    def _on_training_end(self):
+        if self.stop_reason:
+            print(f"\nTraining ended: {self.stop_reason}")
 
 
 class PeriodicRenderCallback(BaseCallback):
@@ -188,15 +298,14 @@ class PeriodicRenderCallback(BaseCallback):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         test_script = os.path.join(script_dir, "test.py")
         
-        # Запускаем новый процесс рендера в отдельном окне консоли
-        # start с заголовком окна выводит его на передний план
-        cmd = f'start "=== ROBOT RENDER TEST ===" cmd /c "python \\"{test_script}\\" \\"{model_path}\\" --episodes {self.render_episodes} --gui"'
+        # Используем PowerShell Start-Process для создания нового окна
+        ps_cmd = f'Start-Process -FilePath "{sys.executable}" -ArgumentList \'"{test_script}" "{model_path}" --episodes {self.render_episodes} --gui\''
         
         try:
-            # Используем shell=True с start для создания активного окна
             self.render_process = subprocess.Popen(
-                cmd,
-                shell=True
+                ["powershell", "-Command", ps_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
             if self.verbose:
                 print(f"  [OK] Render window opened")
@@ -257,9 +366,17 @@ def train(args):
         "image_size": args.image_size,
         "freeze_layers": args.freeze,
         "total_timesteps": args.steps,
+        "target_success": args.target_success,
+        "patience": args.patience,
         "n_envs": args.n_envs,
         "seed": args.seed
     }
+    
+    # Сохраняем конфиг сразу в начале (один для всех checkpoints)
+    config_path = os.path.join(models_dir, f"{exp_name}_config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"[OK] Config saved: {config_path}")
     
     print(f"\nExperiment: {exp_name}")
     print(f"\nSettings:")
@@ -268,7 +385,9 @@ def train(args):
     print(f"  - Camera: {args.camera}")
     print(f"  - Image size: {args.image_size}x{args.image_size}")
     print(f"  - Freeze layers: {args.freeze}")
-    print(f"  - Total steps: {args.steps:,}")
+    print(f"  - Max steps: {args.steps:,}")
+    print(f"  - Target success: {args.target_success}%")
+    print(f"  - Patience: {args.patience:,} steps")
     print(f"  - Parallel envs: {args.n_envs}")
     if args.render > 0:
         print(f"  - Periodic render: {args.render} episodes at checkpoints")
@@ -298,15 +417,22 @@ def train(args):
     print("[OK] Environments created")
     
     # Select feature extractor
-    if args.network == "mobilenet":
-        extractor_class = MobileNetExtractor
+    # Для side+depth и side+wrist используем специальный extractor с Dict observation
+    if args.camera in ("side+depth", "side+wrist"):
+        extractor_class = MobileNetWithDepthExtractor
         extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
-    elif args.network == "efficientnet":
-        extractor_class = EfficientNetExtractor
-        extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
+        policy_type = "MultiInputPolicy"  # Для Dict observation space
     else:
-        extractor_class = SimpleCNNExtractor
-        extractor_kwargs = {"features_dim": 256}
+        policy_type = "CnnPolicy"
+        if args.network == "mobilenet":
+            extractor_class = MobileNetExtractor
+            extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
+        elif args.network == "efficientnet":
+            extractor_class = EfficientNetExtractor
+            extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
+        else:
+            extractor_class = SimpleCNNExtractor
+            extractor_kwargs = {"features_dim": 256}
     
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
@@ -319,7 +445,7 @@ def train(args):
     
     if args.algo == "ppo":
         model = PPO(
-            "CnnPolicy",
+            policy_type,
             env,
             policy_kwargs=policy_kwargs,
             learning_rate=3e-4,
@@ -338,7 +464,7 @@ def train(args):
         )
     else:  # SAC
         model = SAC(
-            "CnnPolicy",
+            policy_type,
             env,
             policy_kwargs=policy_kwargs,
             learning_rate=3e-4,
@@ -371,7 +497,16 @@ def train(args):
     progress_cb = ProgressCallback(check_freq=10000)
     success_cb = SuccessRateCallback()
     
-    callbacks_list = [eval_cb, progress_cb, success_cb]
+    # Early stopping callback
+    early_stop_cb = EarlyStoppingCallback(
+        success_callback=success_cb,
+        target_success=args.target_success / 100.0,  # Convert % to ratio
+        patience=args.patience,
+        min_steps=args.min_steps,  # Patience активируется после этого шага
+        check_freq=10000
+    )
+    
+    callbacks_list = [eval_cb, progress_cb, success_cb, early_stop_cb]
     
     # Добавляем PeriodicRenderCallback если нужен рендер
     if args.render > 0:
@@ -389,6 +524,10 @@ def train(args):
     # Training
     print("\n" + "=" * 60)
     print("STARTING TRAINING")
+    print(f"  Target success rate: {args.target_success}%")
+    print(f"  Max steps: {args.steps:,}")
+    print(f"  Early stop patience: {args.patience:,} steps")
+    print(f"  Manual stop: create 'RL3/STOP' file")
     if args.render > 0:
         print(f"  Periodic render: {args.render} episodes at checkpoints")
         print(f"  Save intervals: 10k -> 50k -> 200k steps")
