@@ -33,25 +33,40 @@ class RobotEnv(gym.Env):
         image_size=64,
         frame_stack=4,
         camera_mode="side",  # "side", "wrist", "both"
-        max_steps=200
+        max_steps=200,
+        curriculum=False,  # Динамический curriculum learning
+        curriculum_threshold=0.3,  # Порог grasp rate для перехода на рандом
+        fixed_object_pos=None  # Фиксированная позиция (переопределяет curriculum)
     ):
         """
         Args:
             render_mode: Режим рендеринга
             use_gui: Показывать GUI PyBullet
             image_size: Размер изображения (64x64)
-            frame_stack: Количество кадров в стеке (для понимания движения)
-            camera_mode: Режим камеры ("side", "wrist", "both")
+            frame_stack: Количество кадров в стеке
+            camera_mode: Режим камеры
             max_steps: Максимум шагов в эпизоде
+            curriculum: Динамический curriculum (фикс. объект пока не научимся)
+            curriculum_threshold: Порог grasp rate для перехода на рандом
+            fixed_object_pos: Фиксированная позиция (x, y)
         """
         super().__init__()
         
         self.render_mode = render_mode
         self.use_gui = use_gui
+        self.fixed_object_pos = fixed_object_pos
+        self.curriculum = curriculum
+        self.curriculum_threshold = curriculum_threshold
         self.image_size = image_size
         self.frame_stack = frame_stack
         self.camera_mode = camera_mode
         self.max_steps = max_steps
+        
+        # Статистика для curriculum
+        self.grasp_history = []  # История касаний за последние N эпизодов
+        self.grasp_history_size = 100
+        self.curriculum_active = curriculum  # Активен ли curriculum сейчас
+        self.episode_had_grasp = False  # Было ли касание в этом эпизоде
         
         # PyBullet
         if self.use_gui:
@@ -182,13 +197,20 @@ class RobotEnv(gym.Env):
         if self.object_id is not None:
             p.removeBody(self.object_id)
         
-        # Случайная позиция на столе (обе стороны, не близко к краям)
-        x = np.random.uniform(0.25, 0.65)
-        # Выбираем левую или правую сторону, не близко к центру
-        if np.random.random() < 0.5:
-            y = np.random.uniform(-0.35, -0.1)  # левая сторона
+        # Определяем позицию: фиксированная, curriculum или случайная
+        if self.fixed_object_pos is not None:
+            # Явно заданная фиксированная позиция
+            x, y = self.fixed_object_pos
+        elif self.curriculum and self.curriculum_active:
+            # Динамический curriculum: фиксированная позиция пока не научимся
+            x, y = 0.45, 0.2  # Справа от центра, легко достижимо
         else:
-            y = np.random.uniform(0.1, 0.35)    # правая сторона
+            # Случайная позиция на столе
+            x = np.random.uniform(0.25, 0.65)
+            if np.random.random() < 0.5:
+                y = np.random.uniform(-0.35, -0.1)  # левая сторона
+            else:
+                y = np.random.uniform(0.1, 0.35)    # правая сторона
         z = 0.025
         
         # Белый цилиндр (хорошо виден в grayscale)
@@ -537,6 +559,25 @@ class RobotEnv(gym.Env):
             self.grasp_constraint = None
         self.object_grasped = False
         
+        # Обновляем статистику curriculum (в конце предыдущего эпизода)
+        if self.curriculum and hasattr(self, 'episode_had_grasp'):
+            self.grasp_history.append(self.episode_had_grasp)
+            if len(self.grasp_history) > self.grasp_history_size:
+                self.grasp_history.pop(0)
+            
+            # Проверяем нужно ли переключить режим
+            if len(self.grasp_history) >= 20:  # Минимум 20 эпизодов для статистики
+                grasp_rate = sum(self.grasp_history) / len(self.grasp_history)
+                
+                if self.curriculum_active and grasp_rate >= self.curriculum_threshold:
+                    # Достигли порога - переходим на случайные позиции
+                    self.curriculum_active = False
+                    print(f"\\n🎓 CURRICULUM: Grasp rate {grasp_rate:.1%} >= {self.curriculum_threshold:.0%}")
+                    print("   Switching to RANDOM object positions!\\n")
+        
+        # Сброс флага касания для нового эпизода
+        self.episode_had_grasp = False
+        
         # Сброс робота в home позицию с небольшим шумом
         for i, joint_idx in enumerate(self.arm_joints):
             noise = np.random.uniform(-0.05, 0.05)
@@ -561,7 +602,7 @@ class RobotEnv(gym.Env):
                 force=50
             )
         
-        # Создание объекта и цели
+        # Создание объекта и цели (цель всегда случайная!)
         self._create_object()
         self._create_goal()
         
@@ -580,6 +621,9 @@ class RobotEnv(gym.Env):
         
         self.step_count = 0
         self.prev_obj_pos = self._get_object_pos().copy()
+        # Начальное расстояние до объекта для reward shaping
+        ee_pos = self._get_ee_pos()
+        self.prev_dist_ee_to_obj = np.linalg.norm(ee_pos - self.prev_obj_pos)
         
         return self._get_observation(), {}
     
@@ -652,11 +696,7 @@ class RobotEnv(gym.Env):
         """
         Вычисление награды для задачи pick-and-place.
         
-        Стратегия: dense reward с фазами
-        1. Приближение к объекту
-        2. Захват объекта
-        3. Перенос к цели
-        4. Размещение на цели
+        Стратегия: reward за УЛУЧШЕНИЕ (shaping), не за абсолютную позицию!
         """
         ee_pos = self._get_ee_pos()
         obj_pos = self._get_object_pos()
@@ -669,6 +709,15 @@ class RobotEnv(gym.Env):
         dist_ee_to_obj = np.linalg.norm(ee_pos - obj_pos)
         dist_obj_to_goal = np.linalg.norm(obj_pos[:2] - goal_pos[:2])
         
+        # Вертикальность клешни (понадобится позже)
+        ee_state = p.getLinkState(self.robot_id, self.end_effector_index)
+        ee_orn = ee_state[1]
+        rot_matrix = np.array(p.getMatrixFromQuaternion(ee_orn)).reshape(3, 3)
+        gripper_down_vector = rot_matrix[:, 2]
+        ideal_down = np.array([0, 0, -1])
+        orientation_alignment = np.dot(gripper_down_vector, ideal_down)
+        vertical_reward = 0.0  # Будет добавлена только когда близко к объекту
+        
         # Проверка падения объекта
         if obj_pos[2] < -0.1:
             reward = -50.0
@@ -679,57 +728,63 @@ class RobotEnv(gym.Env):
         if not self.object_grasped:
             # === ФАЗА 1: Приближение к объекту ===
             
-            # Dense reward за приближение
-            approach_reward = np.exp(-5.0 * dist_ee_to_obj)
-            reward += approach_reward * 2.0
+            # Награда за ПРИБЛИЖЕНИЕ (изменение расстояния)
+            if self.prev_dist_ee_to_obj is not None:
+                delta = self.prev_dist_ee_to_obj - dist_ee_to_obj
+                reward += delta * 10.0  # Положительная если приблизились
             
-            # Высота: поощряем подход сверху
-            ideal_height = obj_pos[2] + 0.08
-            height_diff = abs(ee_pos[2] - ideal_height)
-            height_reward = np.exp(-10.0 * height_diff)
-            reward += height_reward * 0.5
+            # Маленький бонус когда очень близко
+            if dist_ee_to_obj < 0.1:
+                reward += 0.5
             
-            # Бонус за контакт (даже без полного захвата)
+            # Высота и вертикальность: поощряем подход сверху когда близко
+            if dist_ee_to_obj < 0.15:
+                ideal_height = obj_pos[2] + 0.08
+                height_diff = abs(ee_pos[2] - ideal_height)
+                if height_diff < 0.05:
+                    reward += 0.3
+                # Вертикальность важна только когда близко!
+                vertical_reward = max(0, orientation_alignment) * 0.3
+                reward += vertical_reward
+            
+            # Бонус за контакт
             if self._check_grasp():
                 reward += 5.0
-                
-            # Большой бонус когда объект схвачен
-            # (это произойдёт после _attach_object в step)
+                self.episode_had_grasp = True  # Отмечаем касание для curriculum
+            
+            self.prev_dist_ee_to_obj = dist_ee_to_obj
                 
         else:
             # === ФАЗА 2: Перенос к цели ===
             
-            # Dense reward за приближение к цели
-            transport_reward = np.exp(-5.0 * dist_obj_to_goal)
-            reward += transport_reward * 3.0
-            
-            # Бонус за удержание
-            reward += 0.5
-            
-            # Проверка движения к цели
+            # Награда за ПРИБЛИЖЕНИЕ к цели
             if self.prev_obj_pos is not None:
                 prev_dist = np.linalg.norm(self.prev_obj_pos[:2] - goal_pos[:2])
-                curr_dist = dist_obj_to_goal
-                if curr_dist < prev_dist:
-                    reward += (prev_dist - curr_dist) * 50.0
+                delta = prev_dist - dist_obj_to_goal
+                reward += delta * 20.0  # Положительная если приблизились к цели
+            
+            # Бонус за удержание
+            reward += 0.3
             
             # === УСПЕХ: объект на цели ===
             if dist_obj_to_goal < 0.04:
                 reward += 100.0
                 terminated = True
                 info = {'success': True, 'reason': 'goal_reached'}
+                self.prev_obj_pos = obj_pos.copy()
                 return reward, terminated, info
         
         self.prev_obj_pos = obj_pos.copy()
         
-        # Штраф за время
-        reward -= 0.01
+        # Штраф за время (мотивация двигаться!)
+        reward -= 0.1
         
         info = {
             'success': False,
             'dist_ee_to_obj': dist_ee_to_obj,
             'dist_obj_to_goal': dist_obj_to_goal,
-            'object_grasped': self.object_grasped
+            'object_grasped': self.object_grasped,
+            'vertical_reward': vertical_reward
         }
         
         return reward, terminated, info

@@ -59,6 +59,8 @@ def parse_args():
                        help='Random seed')
     parser.add_argument('--render', type=int, default=2,
                        help='Episodes to render at each checkpoint (0 = disable)')
+    parser.add_argument('--curriculum', action='store_true',
+                       help='Dynamic curriculum: fixed object until 30%% grasp rate, then random')
     return parser.parse_args()
 
 
@@ -354,8 +356,15 @@ def train(args):
         'image_size': args.image_size,
         'frame_stack': 4,
         'camera_mode': args.camera,
-        'max_steps': 200
+        'max_steps': 200,
+        'curriculum': args.curriculum,  # Динамический curriculum
+        'curriculum_threshold': 0.3,  # 30% касаний для перехода на рандом
     }
+    
+    if args.curriculum:
+        print("[CURRICULUM] Dynamic curriculum enabled!")
+        print("  - Object position: FIXED until 30% grasp rate")
+        print("  - Goal position: always RANDOM")
     
     # Config
     config = {

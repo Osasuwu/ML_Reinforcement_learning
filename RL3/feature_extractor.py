@@ -324,16 +324,32 @@ class MobileNetWithDepthExtractor(BaseFeaturesExtractor):
             out = self.image_features(sample)
             image_feature_size = out.shape[1]
         
-        # === Маленькая сеть для secondary 8x8 ===
-        # 4 кадра по 8x8 = 256 входных значений, очень мало!
-        self.secondary_net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_channels_secondary * self.secondary_size * self.secondary_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU()
-        )
-        secondary_feature_size = 32
+        # === CNN сеть для secondary камеры ===
+        # Для 32x32: используем лёгкую CNN вместо простого FC
+        # Для 8x8 или меньше: простой FC достаточно
+        if self.secondary_size >= 16:
+            # CNN для больших secondary камер (16x16, 32x32)
+            self.secondary_net = nn.Sequential(
+                nn.Conv2d(in_channels_secondary, 32, kernel_size=3, stride=2, padding=1),  # 32 -> 16
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 16 -> 8
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),  # 8 -> 4
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten()
+            )
+            secondary_feature_size = 64
+        else:
+            # Простой FC для маленьких (8x8 и меньше)
+            self.secondary_net = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(in_channels_secondary * self.secondary_size * self.secondary_size, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.ReLU()
+            )
+            secondary_feature_size = 64
         
         # === Комбинированная голова ===
         combined_size = image_feature_size + secondary_feature_size
