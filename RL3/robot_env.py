@@ -163,11 +163,11 @@ class RobotEnv(gym.Env):
         # Плоскость
         self.plane_id = p.loadURDF("plane.urdf")
         
-        # Стол
+        # Стол (полностью прозрачный - пол в клетку служит ориентиром для расстояния)
         table_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.2])
         table_visual = p.createVisualShape(
             p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.2],
-            rgbaColor=[0.6, 0.6, 0.6, 1]
+            rgbaColor=[0, 0, 0, 0]  # Полностью прозрачный
         )
         self.table_id = p.createMultiBody(
             baseMass=0,
@@ -193,7 +193,7 @@ class RobotEnv(gym.Env):
         self.goal_id = None
         
     def _create_object(self):
-        """Создание объекта для переноса"""
+        """Создание объекта для переноса. Объект ВСЕГДА справа (y > 0)"""
         if self.object_id is not None:
             p.removeBody(self.object_id)
         
@@ -205,12 +205,9 @@ class RobotEnv(gym.Env):
             # Динамический curriculum: фиксированная позиция пока не научимся
             x, y = 0.45, 0.2  # Справа от центра, легко достижимо
         else:
-            # Случайная позиция на столе
+            # Случайная позиция на ПРАВОЙ стороне стола (y > 0)
             x = np.random.uniform(0.25, 0.65)
-            if np.random.random() < 0.5:
-                y = np.random.uniform(-0.35, -0.1)  # левая сторона
-            else:
-                y = np.random.uniform(0.1, 0.35)    # правая сторона
+            y = np.random.uniform(0.1, 0.35)  # Только справа!
         z = 0.025
         
         # Белый цилиндр (хорошо виден в grayscale)
@@ -231,21 +228,16 @@ class RobotEnv(gym.Env):
         return self.object_start_pos
     
     def _create_goal(self):
-        """Создание целевой зоны (на противоположной стороне от объекта)"""
+        """Создание целевой зоны. Цель ВСЕГДА слева (y < 0)"""
         if self.goal_id is not None:
             p.removeBody(self.goal_id)
         
-        # Генерируем позицию пока она не будет достаточно далеко от объекта
+        # Цель всегда на ЛЕВОЙ стороне (y < 0), достаточно далеко от объекта
         min_distance = 0.2
-        for _ in range(50):  # Максимум 50 попыток
+        for _ in range(50):
             x = np.random.uniform(0.25, 0.65)
-            # Выбираем сторону, противоположную объекту
-            if self.object_start_pos[1] < 0:
-                y = np.random.uniform(0.1, 0.35)   # правая сторона
-            else:
-                y = np.random.uniform(-0.35, -0.1) # левая сторона
+            y = np.random.uniform(-0.35, -0.1)  # Только слева!
             
-            # Проверяем расстояние от объекта
             dist = np.sqrt((x - self.object_start_pos[0])**2 + (y - self.object_start_pos[1])**2)
             if dist >= min_distance:
                 break
@@ -274,7 +266,7 @@ class RobotEnv(gym.Env):
                 cameraTargetPosition=[0.45, 0.0, 0.05],
                 distance=1.0,
                 yaw=90,   # Спереди (смотрит вдоль оси X)
-                pitch=-25,
+                pitch=-23,
                 roll=0,
                 upAxisIndex=2
             )
@@ -345,12 +337,11 @@ class RobotEnv(gym.Env):
             upscale: если True, возвращает апскейленное изображение (для визуализации)
                      если False, возвращает 8x8 (для нейросети)
         """
-        # Камера с противоположной стороны от основной (зеркально)
-        # Основная side: yaw=90 (спереди), эта: yaw=-90 (сзади)
+        
         view_matrix = p.computeViewMatrixFromYawPitchRoll(
             cameraTargetPosition=[0.45, 0.0, 0.05],  # Центр рабочей зоны (как у side)
             distance=1.0,
-            yaw=180,   # С противоположной стороны от основной камеры
+            yaw=180,   # Сбоку
             pitch=-25, # Как у основной камеры
             roll=0,
             upAxisIndex=2
@@ -696,7 +687,7 @@ class RobotEnv(gym.Env):
         """
         Вычисление награды для задачи pick-and-place.
         
-        Стратегия: reward за УЛУЧШЕНИЕ (shaping), не за абсолютную позицию!
+        Стратегия: reward ТОЛЬКО за УЛУЧШЕНИЕ (delta), никаких постоянных бонусов!
         """
         ee_pos = self._get_ee_pos()
         obj_pos = self._get_object_pos()
@@ -709,15 +700,6 @@ class RobotEnv(gym.Env):
         dist_ee_to_obj = np.linalg.norm(ee_pos - obj_pos)
         dist_obj_to_goal = np.linalg.norm(obj_pos[:2] - goal_pos[:2])
         
-        # Вертикальность клешни (понадобится позже)
-        ee_state = p.getLinkState(self.robot_id, self.end_effector_index)
-        ee_orn = ee_state[1]
-        rot_matrix = np.array(p.getMatrixFromQuaternion(ee_orn)).reshape(3, 3)
-        gripper_down_vector = rot_matrix[:, 2]
-        ideal_down = np.array([0, 0, -1])
-        orientation_alignment = np.dot(gripper_down_vector, ideal_down)
-        vertical_reward = 0.0  # Будет добавлена только когда близко к объекту
-        
         # Проверка падения объекта
         if obj_pos[2] < -0.1:
             reward = -50.0
@@ -728,29 +710,15 @@ class RobotEnv(gym.Env):
         if not self.object_grasped:
             # === ФАЗА 1: Приближение к объекту ===
             
-            # Награда за ПРИБЛИЖЕНИЕ (изменение расстояния)
+            # Награда ТОЛЬКО за ПРИБЛИЖЕНИЕ (изменение расстояния)
             if self.prev_dist_ee_to_obj is not None:
                 delta = self.prev_dist_ee_to_obj - dist_ee_to_obj
                 reward += delta * 10.0  # Положительная если приблизились
             
-            # Маленький бонус когда очень близко
-            if dist_ee_to_obj < 0.1:
-                reward += 0.5
-            
-            # Высота и вертикальность: поощряем подход сверху когда близко
-            if dist_ee_to_obj < 0.15:
-                ideal_height = obj_pos[2] + 0.08
-                height_diff = abs(ee_pos[2] - ideal_height)
-                if height_diff < 0.05:
-                    reward += 0.3
-                # Вертикальность важна только когда близко!
-                vertical_reward = max(0, orientation_alignment) * 0.3
-                reward += vertical_reward
-            
-            # Бонус за контакт
+            # Бонус за контакт (одноразовый важный момент)
             if self._check_grasp():
                 reward += 5.0
-                self.episode_had_grasp = True  # Отмечаем касание для curriculum
+                self.episode_had_grasp = True
             
             self.prev_dist_ee_to_obj = dist_ee_to_obj
                 
@@ -761,10 +729,7 @@ class RobotEnv(gym.Env):
             if self.prev_obj_pos is not None:
                 prev_dist = np.linalg.norm(self.prev_obj_pos[:2] - goal_pos[:2])
                 delta = prev_dist - dist_obj_to_goal
-                reward += delta * 20.0  # Положительная если приблизились к цели
-            
-            # Бонус за удержание
-            reward += 0.3
+                reward += delta * 20.0
             
             # === УСПЕХ: объект на цели ===
             if dist_obj_to_goal < 0.04:
@@ -776,15 +741,14 @@ class RobotEnv(gym.Env):
         
         self.prev_obj_pos = obj_pos.copy()
         
-        # Штраф за время (мотивация двигаться!)
+        # Штраф за время
         reward -= 0.1
         
         info = {
             'success': False,
             'dist_ee_to_obj': dist_ee_to_obj,
             'dist_obj_to_goal': dist_obj_to_goal,
-            'object_grasped': self.object_grasped,
-            'vertical_reward': vertical_reward
+            'object_grasped': self.object_grasped
         }
         
         return reward, terminated, info

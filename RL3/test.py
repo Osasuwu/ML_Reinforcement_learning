@@ -116,30 +116,37 @@ def load_config(model_path):
     # Вариант 1: точное совпадение (model_config.json)
     config_path = model_path.replace('.zip', '_config.json')
     if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
     # Вариант 2: общий конфиг эксперимента {exp_name}_config.json
     # pickplace_mobilenet_side+depth_ppo_1000k_10k.zip -> pickplace_mobilenet_side+depth_ppo_1000k_config.json
     base_path = re.sub(r'_\d+k\.zip$', '_config.json', model_path)
     if os.path.exists(base_path):
-        with open(base_path, 'r') as f:
+        with open(base_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    # Вариант 2b: для _interrupted.zip, _continued.zip и т.д.
+    base_path = re.sub(r'_(interrupted|continued|final|best)\.zip$', '_config.json', model_path)
+    if os.path.exists(base_path):
+        with open(base_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
     # Вариант 3: _final_config или _best_config
     for suffix in ['_final_config.json', '_best_config.json']:
         base_path = re.sub(r'_\d+k\.zip$', suffix, model_path)
         if os.path.exists(base_path):
-            with open(base_path, 'r') as f:
+            with open(base_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
     
     # Вариант 4: ищем любой config в той же папке с похожим именем
-    match = re.match(r'(.+?)_\d+k', model_name)
+    # Работает для _10k.zip, _interrupted.zip и т.д.
+    match = re.match(r'(.+?)_(\d+k|interrupted|continued|final|best)', model_name)
     if match:
         exp_base = match.group(1)
         for fname in os.listdir(model_dir):
             if fname.startswith(exp_base) and fname.endswith('_config.json'):
-                with open(os.path.join(model_dir, fname), 'r') as f:
+                with open(os.path.join(model_dir, fname), 'r', encoding='utf-8') as f:
                     return json.load(f)
     
     return None
@@ -152,11 +159,13 @@ def test_model(model_path, n_episodes=10, use_gui=True, slow=True):
     
     try:
         _run_test(model_path, n_episodes, use_gui, slow)
+        print("\n[SUCCESS] Test completed, closing...")
+        time.sleep(1)  # Короткая пауза чтобы увидеть результат
     except Exception as e:
         print(f"\n[ERROR] Test failed: {e}")
         import traceback
         traceback.print_exc()
-    finally:
+        # Ждём ввода только при ошибке
         if use_gui:
             print("\n[Press Enter to close]")
             try:
@@ -245,8 +254,10 @@ def _run_test(model_path, n_episodes=10, use_gui=True, slow=True):
     
     # Создаём окно для визуализации с правильными пропорциями
     if use_gui:
+        # Для двух камер: ширина удваивается, высота остаётся (камеры рядом горизонтально)
+        # Для одной камеры: квадратное окно 256x256
         window_width = 256 * n_cameras  # 256 для 1 камеры, 512 для 2
-        window_height = 256
+        window_height = 256  # Высота одинакова, камеры расположены горизонтально
         cv2.namedWindow("Neural Network Input", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Neural Network Input", window_width, window_height)
         cv2.moveWindow("Neural Network Input", 50, 50)

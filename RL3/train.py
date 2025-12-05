@@ -222,7 +222,12 @@ class EarlyStoppingCallback(BaseCallback):
 class PeriodicRenderCallback(BaseCallback):
     """
     Периодически сохраняет модель и запускает рендер-тест.
-    Checkpoints: каждые 10k до 100k, каждые 50k до 500k, каждые 200k после.
+    
+    Сохранение моделей:
+    - Каждые 10k до 40k, каждые 20k до 100k, каждые 100k после
+    
+    Рендер-тесты:
+    - Только до 100k шагов (10k до 40k, 20k до 100k)
     """
     def __init__(self, models_dir, exp_name, env_kwargs, total_steps, 
                  render_episodes=2, verbose=1):
@@ -234,52 +239,73 @@ class PeriodicRenderCallback(BaseCallback):
         self.render_episodes = render_episodes
         self.render_process = None
         
-        # Генерируем список checkpoints заранее
-        self.checkpoints = self._generate_checkpoints(total_steps)
-        self.next_checkpoint_idx = 0
+        # Генерируем списки checkpoints заранее
+        self.save_checkpoints = self._generate_save_checkpoints(total_steps)
+        self.render_checkpoints = self._generate_render_checkpoints(total_steps)
+        self.next_save_idx = 0
+        self.next_render_idx = 0
         
-    def _generate_checkpoints(self, total_steps):
-        """Генерирует список checkpoints"""
+    def _generate_save_checkpoints(self, total_steps):
+        """Генерирует список checkpoints для сохранения моделей."""
         checkpoints = []
         
-        # Каждые 10k до 100k
-        for step in range(10000, min(100001, total_steps + 1), 10000):
+        # Каждые 10k до 40k
+        for step in range(10000, min(40001, total_steps + 1), 10000):
             checkpoints.append(step)
         
-        # Каждые 50k от 100k до 500k  
-        for step in range(150000, min(500001, total_steps + 1), 50000):
+        # Каждые 20k от 40k до 100k
+        for step in range(60000, min(100001, total_steps + 1), 20000):
             checkpoints.append(step)
         
-        # Каждые 200k после 500k
-        for step in range(600000, total_steps + 1, 200000):
+        # Каждые 100k после 100k
+        for step in range(200000, total_steps + 1, 100000):
+            checkpoints.append(step)
+        
+        return sorted(set(checkpoints))
+    
+    def _generate_render_checkpoints(self, total_steps):
+        """Генерирует список checkpoints для рендер-тестов (только до 100k)."""
+        checkpoints = []
+        
+        # Каждые 10k до 40k
+        for step in range(10000, min(40001, total_steps + 1), 10000):
+            checkpoints.append(step)
+        
+        # Каждые 20k от 40k до 100k
+        for step in range(60000, min(100001, total_steps + 1), 20000):
             checkpoints.append(step)
         
         return sorted(set(checkpoints))
     
     def _on_step(self) -> bool:
-        # Проверяем достигли ли следующего checkpoint
-        if self.next_checkpoint_idx >= len(self.checkpoints):
-            return True
+        # Проверяем сохранение модели
+        if self.next_save_idx < len(self.save_checkpoints):
+            next_save = self.save_checkpoints[self.next_save_idx]
             
-        next_checkpoint = self.checkpoints[self.next_checkpoint_idx]
+            if self.num_timesteps >= next_save:
+                self.next_save_idx += 1
+                
+                # Сохраняем модель
+                save_path = os.path.abspath(os.path.join(
+                    self.models_dir, 
+                    f"{self.exp_name}_{next_save//1000}k.zip"
+                ))
+                self.model.save(save_path)
+                
+                if self.verbose:
+                    print(f"\n[CHECKPOINT {next_save//1000}k]")
+                    print(f"  Model saved: {save_path}")
+                
+                # Проверяем нужен ли рендер-тест
+                if self.next_render_idx < len(self.render_checkpoints):
+                    next_render = self.render_checkpoints[self.next_render_idx]
+                    if next_save == next_render:
+                        self.next_render_idx += 1
+                        if self.verbose:
+                            print(f"  Starting render test ({self.render_episodes} episodes)...")
+                        self._start_render_test(save_path)
         
-        if self.num_timesteps >= next_checkpoint:
-            self.next_checkpoint_idx += 1
-            
-            # Сохраняем модель (абсолютный путь)
-            save_path = os.path.abspath(os.path.join(
-                self.models_dir, 
-                f"{self.exp_name}_{next_checkpoint//1000}k.zip"
-            ))
-            self.model.save(save_path)
-            
-            if self.verbose:
-                print(f"\n[CHECKPOINT {next_checkpoint//1000}k]")
-                print(f"  Model saved: {save_path}")
-                print(f"  Starting render test ({self.render_episodes} episodes)...")
-            
-            # Запускаем рендер в отдельном процессе
-            self._start_render_test(save_path)
+        return True
         
         return True
     
