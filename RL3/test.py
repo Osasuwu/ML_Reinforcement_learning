@@ -119,14 +119,27 @@ def load_config(model_path):
         with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    # Вариант 2: общий конфиг эксперимента {exp_name}_config.json
+    # Вариант 2: ищем любой config в папке с похожим базовым именем
+    # pickplace_mobilenet_side+depth_ppo_300k.zip -> ищем pickplace_mobilenet_side+depth_ppo_*_config.json
+    # Извлекаем базовое имя: всё до последнего _\d+k или _interrupted и т.д.
+    base_match = re.match(r'(.+?_ppo)_', model_name)
+    if base_match:
+        exp_base = base_match.group(1)
+        for fname in os.listdir(model_dir):
+            if fname.startswith(exp_base) and fname.endswith('_config.json'):
+                config_file = os.path.join(model_dir, fname)
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    print(f"  [INFO] Using config: {fname}")
+                    return json.load(f)
+    
+    # Вариант 3: общий конфиг эксперимента {exp_name}_config.json
     # pickplace_mobilenet_side+depth_ppo_1000k_10k.zip -> pickplace_mobilenet_side+depth_ppo_1000k_config.json
     base_path = re.sub(r'_\d+k\.zip$', '_config.json', model_path)
     if os.path.exists(base_path):
         with open(base_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    # Вариант 2b: для _interrupted.zip, _continued.zip и т.д.
+    # Вариант 4: для _interrupted.zip, _continued.zip и т.д.
     base_path = re.sub(r'_(interrupted|continued|final|best)\.zip$', '_config.json', model_path)
     if os.path.exists(base_path):
         with open(base_path, 'r', encoding='utf-8') as f:

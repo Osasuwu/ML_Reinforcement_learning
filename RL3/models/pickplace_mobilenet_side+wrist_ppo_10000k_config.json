@@ -1,0 +1,13 @@
+{
+  "experiment_name": "pickplace_mobilenet_side+wrist_ppo_10000k",
+  "network": "mobilenet",
+  "algorithm": "ppo",
+  "camera_mode": "side+wrist",
+  "image_size": 64,
+  "freeze_layers": 8,
+  "total_timesteps": 10000000,
+  "target_success": 80.0,
+  "patience": 500000,
+  "n_envs": 4,
+  "seed": 42
+}

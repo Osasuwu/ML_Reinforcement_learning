@@ -18,7 +18,13 @@ class MobileNetExtractor(BaseFeaturesExtractor):
     
     Предобученная модель с частичной заморозкой слоёв.
     Преобразует grayscale изображения в 3-канальные для MobileNet.
+    
+    ВАЖНО: Используем ImageNet нормализацию для совместимости с предобученными весами.
     """
+    
+    # ImageNet нормализация (усреднённые для grayscale)
+    IMAGENET_MEAN = 0.449  # среднее (0.485 + 0.456 + 0.406) / 3
+    IMAGENET_STD = 0.226   # среднее (0.229 + 0.224 + 0.225) / 3
     
     def __init__(self, observation_space: spaces.Box, features_dim: int = 256, 
                  freeze_layers: int = 8):
@@ -110,8 +116,9 @@ class MobileNetExtractor(BaseFeaturesExtractor):
         x = observations.permute(0, 1, 4, 2, 3)  # (batch, frame_stack, n_cameras, H, W)
         x = x.reshape(batch_size, -1, self.height, self.width)
         
-        # Нормализация [0, 255] -> [0, 1]
-        x = x.float() / 255.0
+        # Простая нормализация [0, 255] -> [-1, 1]
+        # ImageNet нормализация НЕ подходит для нашей сцены PyBullet!
+        x = x.float() / 127.5 - 1.0
         
         # MobileNet features
         x = self.features(x)
@@ -270,7 +277,13 @@ class MobileNetWithDepthExtractor(BaseFeaturesExtractor):
     
     MobileNet для изображения + маленькая FC сеть для вторичной камеры.
     Экономит память: 64x64 + 8x8 вместо 64x64 + 64x64
+    
+    ВАЖНО: Используем ImageNet нормализацию для совместимости с предобученными весами.
     """
+    
+    # ImageNet нормализация (усреднённые для grayscale)
+    IMAGENET_MEAN = 0.449
+    IMAGENET_STD = 0.226
     
     def __init__(self, observation_space: spaces.Dict, features_dim: int = 256,
                  freeze_layers: int = 8):
@@ -385,7 +398,8 @@ class MobileNetWithDepthExtractor(BaseFeaturesExtractor):
         # === Image branch ===
         # (batch, frame_stack, H, W, 1) -> (batch, frame_stack, H, W)
         x_img = images.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.image_height, self.image_width)
-        x_img = x_img.float() / 255.0
+        # Простая нормализация [-1, 1] - лучше для нашей сцены
+        x_img = x_img.float() / 127.5 - 1.0
         x_img = self.image_features(x_img)
         x_img = self.image_pool(x_img)
         x_img = x_img.flatten(1)
@@ -393,8 +407,133 @@ class MobileNetWithDepthExtractor(BaseFeaturesExtractor):
         # === Secondary branch ===
         # (batch, frame_stack, 8, 8, 1) -> (batch, frame_stack * 8 * 8)
         x_sec = secondary.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.secondary_size, self.secondary_size)
-        x_sec = x_sec.float() / 255.0
+        # Простая нормализация для secondary
+        x_sec = x_sec.float() / 127.5 - 1.0
         x_sec = self.secondary_net(x_sec)
+        
+        # === Combine ===
+        x = torch.cat([x_img, x_sec], dim=1)
+        x = self.fc(x)
+        
+        return x
+
+
+class SimpleCNNWithDepthExtractor(BaseFeaturesExtractor):
+    """
+    Простая CNN для side+depth режима БЕЗ предобучения.
+    
+    Преимущества:
+    - Все слои обучаются с нуля под нашу задачу
+    - Нет "шума" от ImageNet признаков
+    - Меньше параметров = быстрее обучение
+    - Лучше сохраняет пространственную информацию
+    
+    Архитектура специально для pick-and-place:
+    - Сохраняет пространственное разрешение дольше
+    - Использует координатные каналы для позиционной информации
+    """
+    
+    def __init__(self, observation_space: spaces.Dict, features_dim: int = 256):
+        super().__init__(observation_space, features_dim)
+        
+        # Image space
+        image_space = observation_space['image']
+        self.frame_stack = image_space.shape[0]
+        self.image_height = image_space.shape[1]
+        self.image_width = image_space.shape[2]
+        
+        # Secondary space
+        self.secondary_key = 'depth' if 'depth' in observation_space.spaces else 'wrist'
+        secondary_space = observation_space[self.secondary_key]
+        self.secondary_size = secondary_space.shape[1]
+        
+        in_channels = self.frame_stack
+        
+        # === CNN для изображения с СОХРАНЕНИЕМ пространственной информации ===
+        # Используем меньший stride чтобы не потерять позицию объекта
+        self.image_cnn = nn.Sequential(
+            # 64x64 -> 32x32
+            nn.Conv2d(in_channels, 32, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            
+            # 32x32 -> 16x16
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            
+            # 16x16 -> 8x8
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            
+            # 8x8 -> 4x4
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            
+            # Global average pooling
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+        
+        # === CNN для secondary (depth) камеры ===
+        if self.secondary_size >= 16:
+            self.secondary_cnn = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten()
+            )
+            secondary_out = 64
+        else:
+            self.secondary_cnn = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(in_channels * self.secondary_size * self.secondary_size, 64),
+                nn.ReLU()
+            )
+            secondary_out = 64
+        
+        # === Комбинированная голова ===
+        image_out = 128
+        combined_size = image_out + secondary_out
+        
+        self.fc = nn.Sequential(
+            nn.Linear(combined_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, features_dim),
+            nn.ReLU()
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        
+        print(f"SimpleCNNWithDepthExtractor создан:")
+        print(f"  - Image: {in_channels} кадров, {self.image_height}x{self.image_width}")
+        print(f"  - Secondary ({self.secondary_key}): {in_channels} кадров, {self.secondary_size}x{self.secondary_size}")
+        print(f"  - Image features: {image_out}")
+        print(f"  - Secondary features: {secondary_out}")
+        print(f"  - Combined: {combined_size} -> {features_dim}")
+        print(f"  - Total params: {total_params:,}")
+        print(f"  - ВСЕ параметры обучаемые (нет заморозки)")
+    
+    def forward(self, observations: dict) -> torch.Tensor:
+        images = observations['image']
+        secondary = observations[self.secondary_key]
+        
+        batch_size = images.shape[0]
+        
+        # === Image branch ===
+        x_img = images.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.image_height, self.image_width)
+        x_img = x_img.float() / 127.5 - 1.0
+        x_img = self.image_cnn(x_img)
+        
+        # === Secondary branch ===
+        x_sec = secondary.permute(0, 1, 4, 2, 3).reshape(batch_size, -1, self.secondary_size, self.secondary_size)
+        x_sec = x_sec.float() / 127.5 - 1.0
+        x_sec = self.secondary_cnn(x_sec)
         
         # === Combine ===
         x = torch.cat([x_img, x_sec], dim=1)

@@ -191,6 +191,7 @@ class RobotEnv(gym.Env):
         
         self.object_id = None
         self.goal_id = None
+        self.goal_hole_id = None  # Внутренняя часть кольца (дырка)
         
     def _create_object(self):
         """Создание объекта для переноса. Объект ВСЕГДА справа (y > 0)"""
@@ -208,13 +209,17 @@ class RobotEnv(gym.Env):
             # Случайная позиция на ПРАВОЙ стороне стола (y > 0)
             x = np.random.uniform(0.25, 0.65)
             y = np.random.uniform(0.1, 0.35)  # Только справа!
-        z = 0.025
+        z = 0.035  # Чуть выше чтобы лучше видно
         
-        # Белый цилиндр (хорошо виден в grayscale)
-        collision = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.02, height=0.05)
+        # ЯРКО-КРАСНЫЙ куб - МАКСИМАЛЬНЫЙ контраст!
+        # Красный в grayscale: 0.299*1 + 0.587*0 + 0.114*0 = 0.299
+        # Это ТЁМНЫЙ цвет на фоне светлого стола - хорошо заметен!
+        # Куб вместо цилиндра - проще форма, легче отслеживать
+        obj_size = 0.035  # Увеличил размер для видимости
+        collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[obj_size, obj_size, obj_size])
         visual = p.createVisualShape(
-            p.GEOM_CYLINDER, radius=0.02, length=0.05,
-            rgbaColor=[1.0, 1.0, 1.0, 1]  # Белый
+            p.GEOM_BOX, halfExtents=[obj_size, obj_size, obj_size],
+            rgbaColor=[0.9, 0.1, 0.1, 1]  # Ярко-красный
         )
         self.object_id = p.createMultiBody(
             baseMass=0.05,
@@ -231,6 +236,8 @@ class RobotEnv(gym.Env):
         """Создание целевой зоны. Цель ВСЕГДА слева (y < 0)"""
         if self.goal_id is not None:
             p.removeBody(self.goal_id)
+        if hasattr(self, 'goal_hole_id') and self.goal_hole_id is not None:
+            p.removeBody(self.goal_hole_id)
         
         # Цель всегда на ЛЕВОЙ стороне (y < 0), достаточно далеко от объекта
         min_distance = 0.2
@@ -242,36 +249,60 @@ class RobotEnv(gym.Env):
             if dist >= min_distance:
                 break
         
-        z = 0.005
+        z = 0.003
         
-        # Тёмный квадрат (хорошо контрастирует с белым объектом в grayscale)
-        visual = p.createVisualShape(
-            p.GEOM_BOX,
-            halfExtents=[0.04, 0.04, 0.005],
-            rgbaColor=[0.2, 0.2, 0.2, 0.9]  # Тёмно-серый
+        # ЗЕЛЁНЫЙ КРУГ с дыркой (тор/кольцо) - отличается формой от красного куба!
+        # Зелёный в grayscale: 0.587 - средний, хорошо отличается от красного (0.299)
+        goal_radius = 0.06  # Внешний радиус - чуть больше объекта
+        hole_radius = 0.025  # Внутренний радиус (дырка)
+        
+        # Создаём кольцо из нескольких цилиндров
+        # Внешний цилиндр (зелёный)
+        outer_visual = p.createVisualShape(
+            p.GEOM_CYLINDER,
+            radius=goal_radius,
+            length=0.006,
+            rgbaColor=[0.1, 0.8, 0.2, 0.95]  # Ярко-зелёный
         )
         self.goal_id = p.createMultiBody(
             baseMass=0,
-            baseVisualShapeIndex=visual,
+            baseVisualShapeIndex=outer_visual,
             basePosition=[x, y, z]
+        )
+        
+        # Внутренний цилиндр (тёмный - создаёт эффект дырки)
+        inner_visual = p.createVisualShape(
+            p.GEOM_CYLINDER,
+            radius=hole_radius,
+            length=0.008,  # Чуть выше чтобы перекрыть
+            rgbaColor=[0.2, 0.2, 0.2, 1.0]  # Тёмно-серый (цвет стола)
+        )
+        self.goal_hole_id = p.createMultiBody(
+            baseMass=0,
+            baseVisualShapeIndex=inner_visual,
+            basePosition=[x, y, z + 0.001]
         )
         
         self.goal_pos = np.array([x, y, 0.025])
         return self.goal_pos
     
     def _get_side_camera_image(self):
-        """Изображение с фронтальной камеры (вид спереди манипулятора)"""
+        """Изображение с боковой камеры (вид сверху-сбоку на рабочую зону)"""
         if self._side_view_matrix is None:
+            # Камера расположена так, чтобы видеть ВСЮ рабочую зону:
+            # - Объект спавнится в x: 0.25-0.65, y: 0.1-0.35 (справа)
+            # - Цель в x: 0.25-0.65, y: -0.35 to -0.1 (слева)
+            # - Центр рабочей зоны примерно в (0.45, 0.0, 0.0)
             self._side_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-                cameraTargetPosition=[0.45, 0.0, 0.05],
-                distance=1.0,
+                cameraTargetPosition=[0.45, 0.0, 0.02],  # Чуть ниже - на уровень объектов
+                distance=0.7,  # БЛИЖЕ! Было 1.0 - слишком далеко
                 yaw=90,   # Спереди (смотрит вдоль оси X)
-                pitch=-23,
+                pitch=-35,  # Больше наклон сверху для лучшего обзора
                 roll=0,
                 upAxisIndex=2
             )
             self._side_proj_matrix = p.computeProjectionMatrixFOV(
-                fov=60, aspect=1.0, nearVal=0.1, farVal=2.0
+                fov=70, aspect=1.0, nearVal=0.1, farVal=2.0  # Шире FOV
             )
         
         _, _, px, _, _ = p.getCameraImage(

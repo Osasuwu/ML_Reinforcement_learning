@@ -25,7 +25,24 @@ if script_dir not in sys.path:
 
 from robot_env import RobotEnv
 from feature_extractor import (MobileNetExtractor, EfficientNetExtractor, 
-                               SimpleCNNExtractor, MobileNetWithDepthExtractor)
+                               SimpleCNNExtractor, MobileNetWithDepthExtractor,
+                               SimpleCNNWithDepthExtractor)
+
+
+def linear_schedule(initial_value: float, final_value: float = 1e-5):
+    """
+    Linear learning rate schedule.
+    
+    Начинает с initial_value и линейно уменьшается до final_value.
+    Это помогает:
+    1. Быстро обучаться на начальных этапах (высокий LR)
+    2. Стабилизироваться на поздних этапах (низкий LR)
+    3. Не "забывать" ранее выученное поведение
+    """
+    def func(progress_remaining: float) -> float:
+        # progress_remaining идёт от 1.0 до 0.0
+        return final_value + progress_remaining * (initial_value - final_value)
+    return func
 
 
 def parse_args():
@@ -47,8 +64,8 @@ def parse_args():
     parser.add_argument('--camera', type=str, default='side',
                        choices=['side', 'side+depth', 'side+wrist'],
                        help='Camera mode (side+depth/wrist adds 8x8 secondary cam)')
-    parser.add_argument('--freeze', type=int, default=8,
-                       help='Number of layers to freeze in pretrained model')
+    parser.add_argument('--freeze', type=int, default=4,
+                       help='Number of layers to freeze in pretrained model (default: 4, MobileNet has 13 layers)')
     parser.add_argument('--n_envs', type=int, default=4,
                        help='Number of parallel environments')
     parser.add_argument('--image_size', type=int, default=64,
@@ -454,9 +471,15 @@ def train(args):
     # Select feature extractor
     # Для side+depth и side+wrist используем специальный extractor с Dict observation
     if args.camera in ("side+depth", "side+wrist"):
-        extractor_class = MobileNetWithDepthExtractor
-        extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
         policy_type = "MultiInputPolicy"  # Для Dict observation space
+        if args.network == "cnn":
+            # Простая CNN - лучше для нашей задачи (все слои обучаются)
+            extractor_class = SimpleCNNWithDepthExtractor
+            extractor_kwargs = {"features_dim": 256}
+        else:
+            # MobileNet с частичной заморозкой
+            extractor_class = MobileNetWithDepthExtractor
+            extractor_kwargs = {"features_dim": 256, "freeze_layers": args.freeze}
     else:
         policy_type = "CnnPolicy"
         if args.network == "mobilenet":
@@ -483,13 +506,13 @@ def train(args):
             policy_type,
             env,
             policy_kwargs=policy_kwargs,
-            learning_rate=3e-4,
+            learning_rate=linear_schedule(3e-4, 1e-5),  # Decay: 3e-4 -> 1e-5
             n_steps=2048,
             batch_size=256,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=linear_schedule(0.2, 0.05),  # Decay clip range too
             ent_coef=0.01,
             max_grad_norm=0.5,
             verbose=1,

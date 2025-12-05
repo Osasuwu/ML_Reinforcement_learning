@@ -1,0 +1,13 @@
+{
+  "experiment_name": "pickplace_mobilenet_side+depth_ppo_500k",
+  "network": "mobilenet",
+  "algorithm": "ppo",
+  "camera_mode": "side+depth",
+  "image_size": 64,
+  "freeze_layers": 4,
+  "total_timesteps": 500000,
+  "target_success": 80.0,
+  "patience": 500000,
+  "n_envs": 8,
+  "seed": 42
+}

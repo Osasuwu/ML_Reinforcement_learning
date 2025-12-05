@@ -27,7 +27,7 @@ RL3/models/*.zip
 RL3/models/*.json
 RL3/models/.gitkeep
 !RL3/models/*_final.zip
-!RL3/models/*_final_config.json
+!RL3/models/*_config.json
 
 # TensorBoard
 tensorboard/
