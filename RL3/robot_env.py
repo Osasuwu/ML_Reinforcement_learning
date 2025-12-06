@@ -138,7 +138,7 @@ class RobotEnv(gym.Env):
         )
         
         # Масштаб действий (радианы за шаг)
-        self.action_scale = 0.05  # ~3 градуса за шаг
+        self.action_scale = 0.1  # ~6 градусов за шаг (было 0.05)
         
         # Буфер кадров
         self.frame_buffer = []

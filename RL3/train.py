@@ -492,10 +492,18 @@ def train(args):
             extractor_class = SimpleCNNExtractor
             extractor_kwargs = {"features_dim": 256}
     
+    # net_arch разный для PPO и SAC!
+    # PPO использует pi (actor) и vf (value function)
+    # SAC использует pi (actor) и qf (Q-function)
+    if args.algo == "ppo":
+        net_arch = dict(pi=[256, 128], vf=[256, 128])
+    else:  # SAC
+        net_arch = dict(pi=[256, 128], qf=[256, 128])
+    
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=extractor_kwargs,
-        net_arch=dict(pi=[256, 128], vf=[256, 128])
+        net_arch=net_arch
     )
     
     # Create model
@@ -506,14 +514,14 @@ def train(args):
             policy_type,
             env,
             policy_kwargs=policy_kwargs,
-            learning_rate=linear_schedule(3e-4, 1e-5),  # Decay: 3e-4 -> 1e-5
+            learning_rate=linear_schedule(1e-4, 5e-6),  # Более консервативный LR для visual RL
             n_steps=2048,
-            batch_size=256,
-            n_epochs=10,
+            batch_size=2048,  # Увеличен: равен n_steps для 1 epoch = buffer_size/batch updates
+            n_epochs=4,  # Уменьшен: 4 epochs × 8 minibatches = 32 gradient updates (было 640!)
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=linear_schedule(0.2, 0.05),  # Decay clip range too
-            ent_coef=0.01,
+            clip_range=linear_schedule(0.2, 0.1),  # Не опускаем слишком низко
+            ent_coef=0.02,  # Увеличен для большего exploration
             max_grad_norm=0.5,
             verbose=1,
             tensorboard_log=tensorboard_dir,
@@ -526,13 +534,14 @@ def train(args):
             env,
             policy_kwargs=policy_kwargs,
             learning_rate=3e-4,
-            buffer_size=100000,
-            learning_starts=1000,
+            buffer_size=50000,  # Уменьшен для экономии памяти (Dict obs занимает много места)
+            learning_starts=5000,
             batch_size=256,
             tau=0.005,
             gamma=0.99,
-            train_freq=1,
-            gradient_steps=1,
+            train_freq=4,
+            gradient_steps=4,
+            ent_coef='auto',
             verbose=1,
             tensorboard_log=tensorboard_dir,
             device=device,
