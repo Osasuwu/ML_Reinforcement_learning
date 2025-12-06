@@ -646,6 +646,7 @@ class RobotEnv(gym.Env):
         # Начальное расстояние до объекта для reward shaping
         ee_pos = self._get_ee_pos()
         self.prev_dist_ee_to_obj = np.linalg.norm(ee_pos - self.prev_obj_pos)
+        self.prev_ee_pos = ee_pos.copy()  # Для раздельного reward по XY и Z
         
         return self._get_observation(), {}
     
@@ -718,7 +719,10 @@ class RobotEnv(gym.Env):
         """
         Вычисление награды для задачи pick-and-place.
         
-        Стратегия: reward ТОЛЬКО за УЛУЧШЕНИЕ (delta), никаких постоянных бонусов!
+        Стратегия: 
+        1. Reward за приближение по XY (горизонтально)
+        2. Bonus за правильную высоту когда близко по XY
+        3. Большой bonus за контакт
         """
         ee_pos = self._get_ee_pos()
         obj_pos = self._get_object_pos()
@@ -727,7 +731,9 @@ class RobotEnv(gym.Env):
         reward = 0.0
         terminated = False
         
-        # Расстояния
+        # Расстояния - ОТДЕЛЬНО XY и Z
+        dist_xy = np.linalg.norm(ee_pos[:2] - obj_pos[:2])
+        dist_z = abs(ee_pos[2] - obj_pos[2])
         dist_ee_to_obj = np.linalg.norm(ee_pos - obj_pos)
         dist_obj_to_goal = np.linalg.norm(obj_pos[:2] - goal_pos[:2])
         
@@ -741,17 +747,31 @@ class RobotEnv(gym.Env):
         if not self.object_grasped:
             # === ФАЗА 1: Приближение к объекту ===
             
-            # Награда ТОЛЬКО за ПРИБЛИЖЕНИЕ (изменение расстояния)
+            # 1. Награда за приближение по XY (основная)
             if self.prev_dist_ee_to_obj is not None:
-                delta = self.prev_dist_ee_to_obj - dist_ee_to_obj
-                reward += delta * 10.0  # Положительная если приблизились
+                prev_xy = np.linalg.norm(self.prev_ee_pos[:2] - obj_pos[:2]) if hasattr(self, 'prev_ee_pos') else dist_xy
+                delta_xy = prev_xy - dist_xy
+                reward += delta_xy * 15.0  # Больше reward за XY приближение
+                
+                # 2. Награда за приближение по Z (когда близко по XY)
+                if dist_xy < 0.15:  # Если уже близко горизонтально
+                    prev_z = abs(self.prev_ee_pos[2] - obj_pos[2]) if hasattr(self, 'prev_ee_pos') else dist_z
+                    delta_z = prev_z - dist_z
+                    reward += delta_z * 20.0  # Сильный сигнал опуститься
             
-            # Бонус за контакт (одноразовый важный момент)
+            # 3. Бонус за близость (continuous, не только delta)
+            if dist_xy < 0.10:
+                reward += 0.1  # Небольшой постоянный бонус за поддержание близости
+            if dist_ee_to_obj < 0.05:
+                reward += 0.3  # Очень близко - больший бонус
+            
+            # 4. Бонус за контакт (одноразовый важный момент)
             if self._check_grasp():
-                reward += 5.0
+                reward += 10.0  # Увеличен бонус за контакт
                 self.episode_had_grasp = True
             
             self.prev_dist_ee_to_obj = dist_ee_to_obj
+            self.prev_ee_pos = ee_pos.copy()
                 
         else:
             # === ФАЗА 2: Перенос к цели ===
@@ -772,12 +792,16 @@ class RobotEnv(gym.Env):
         
         self.prev_obj_pos = obj_pos.copy()
         
-        # Штраф за время
-        reward -= 0.1
+        # Маленький штраф за время - но только если далеко от объекта
+        # Когда близко, бонусы за близость перевешивают
+        if dist_ee_to_obj > 0.1:
+            reward -= 0.05  # Уменьшен штраф
         
         info = {
             'success': False,
             'dist_ee_to_obj': dist_ee_to_obj,
+            'dist_xy': dist_xy,
+            'dist_z': dist_z,
             'dist_obj_to_goal': dist_obj_to_goal,
             'object_grasped': self.object_grasped
         }

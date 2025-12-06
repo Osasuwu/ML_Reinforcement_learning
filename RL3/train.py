@@ -514,14 +514,14 @@ def train(args):
             policy_type,
             env,
             policy_kwargs=policy_kwargs,
-            learning_rate=linear_schedule(1e-4, 5e-6),  # Более консервативный LR для visual RL
+            learning_rate=linear_schedule(3e-4, 1e-5),  # Более высокий начальный LR
             n_steps=2048,
-            batch_size=2048,  # Увеличен: равен n_steps для 1 epoch = buffer_size/batch updates
-            n_epochs=4,  # Уменьшен: 4 epochs × 8 minibatches = 32 gradient updates (было 640!)
+            batch_size=256,  # Уменьшен для более частых обновлений (8 minibatches per epoch)
+            n_epochs=10,  # Больше epochs для лучшего использования данных
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=linear_schedule(0.2, 0.1),  # Не опускаем слишком низко
-            ent_coef=0.02,  # Увеличен для большего exploration
+            clip_range=linear_schedule(0.2, 0.05),  # Более агрессивное уменьшение
+            ent_coef=0.05,  # УВЕЛИЧЕН для большего exploration (было 0.02)
             max_grad_norm=0.5,
             verbose=1,
             tensorboard_log=tensorboard_dir,
